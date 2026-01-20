@@ -61,7 +61,6 @@ Thumbs.db
 # Project specific
 !data/mappings/alias.yaml
 temp.md
-DEPLOY.md
 
 # Docker
 docker-compose.override.yml
