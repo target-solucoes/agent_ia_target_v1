@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(dir /b \"C:\\\\Projects\\\\Target\\\\TargetLabs\\\\IA_Agent\\\\LangGraph\\\\graph_classifier_v1_1_gemini_deploy_v02\")",
-      "Bash(python:*)"
-    ]
-  }
-}
