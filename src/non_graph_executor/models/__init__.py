@@ -9,6 +9,12 @@ from src.non_graph_executor.models.schemas import (
     NonGraphOutput,
     QueryTypeClassification,
 )
+from src.non_graph_executor.models.intent_schema import (
+    QueryIntent,
+    ColumnSpec,
+    AggregationSpec,
+    OrderSpec,
+)
 from src.non_graph_executor.models.llm_loader import (
     NonGraphLLMConfig,
     load_llm,
@@ -17,6 +23,10 @@ from src.non_graph_executor.models.llm_loader import (
 __all__ = [
     "NonGraphOutput",
     "QueryTypeClassification",
+    "QueryIntent",
+    "ColumnSpec",
+    "AggregationSpec",
+    "OrderSpec",
     "NonGraphLLMConfig",
     "load_llm",
 ]

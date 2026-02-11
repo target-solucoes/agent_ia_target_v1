@@ -1,24 +1,33 @@
 """
 Pydantic schemas and LLM configuration for insight generator.
 
-This module defines the output schemas for insights and the LLM loader function.
+This module defines the output schemas for insights, the LLM loader function,
+and the dynamic model selection logic (FASE 3).
 
 GEMINI MIGRATION:
 - Uses ChatGoogleGenerativeAI (Google Gemini)
-- Model: gemini-2.5-flash-preview-09-2025
+- Model: gemini-2.5-flash (default, FASE 3 upgrade)
 - Optimizations: timeout=30s, max_retries=2
-- temperature=0.7 for creative insights
+- temperature=0.4 for balanced output
 - JSON mode automatic (response_mime_type="application/json")
 
 References:
 - Authentication: https://colab.research.google.com/github/google-gemini/cookbook/blob/main/quickstarts/Authentication.ipynb
 """
 
+import logging
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from src.shared_lib.core.config import get_insight_config
+from ..core.settings import (
+    INSIGHT_MODEL_DEFAULT,
+    INSIGHT_MODEL_LITE,
+    INSIGHT_TEMPERATURE_DEFAULT,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class InsightItem(BaseModel):
@@ -51,26 +60,111 @@ class InsightOutput(BaseModel):
     error: Optional[str] = None
 
 
-def load_insight_llm() -> ChatGoogleGenerativeAI:
+def select_insight_model(enriched_intent: Optional[Dict[str, Any]] = None) -> str:
     """
-    Carrega Google Gemini com temperature=0.7 e JSON mode.
+    Select the appropriate LLM model based on query complexity.
 
-    Uses centralized Gemini configuration with optimizations:
-    - timeout=30s (50% reduction from default 60s)
-    - max_retries=2 (fail fast instead of many retries)
-    - max_output_tokens=1500 (optimized default)
-    - temperature=0.7 (higher temperature for creative insights)
-    - JSON mode automatic (response_mime_type="application/json")
+    FASE 3: Dynamic model selection based on enriched_intent metadata.
+    Complex queries (comparisons, variations, negative polarity, temporal)
+    use the full flash model. Simple queries (rankings, distributions with
+    single period) can use flash-lite for lower latency and cost.
 
-    Boas práticas Gemini:
-    - Usar temperature para controlar criatividade (0.0-2.0)
-    - response_mime_type: "application/json" para garantir output estruturado
-    - System instructions para contexto
+    Decision criteria:
+        flash (default):
+            - base_intent in {comparison, variation, composition, trend}
+            - polarity == NEGATIVE
+            - comparison_type != NONE
+            - temporal_focus in {PERIOD_OVER_PERIOD, TIME_SERIES}
+            - No enriched_intent available (safe default)
 
-    Ref: https://colab.research.google.com/github/google-gemini/cookbook/blob/main/quickstarts/System_instructions.ipynb
+        flash-lite:
+            - base_intent in {ranking, distribution}
+            - temporal_focus == SINGLE_PERIOD
+            - polarity != NEGATIVE
+            - comparison_type == NONE
+
+    Args:
+        enriched_intent: Optional dict with base_intent, polarity,
+                        temporal_focus, comparison_type, etc.
 
     Returns:
-        ChatGoogleGenerativeAI: Instância configurada com timeout, retry e JSON mode
+        Model name string (e.g., "gemini-2.5-flash")
     """
-    config = get_insight_config()
+    if enriched_intent is None:
+        logger.debug("[select_insight_model] No enriched_intent, using default model")
+        return INSIGHT_MODEL_DEFAULT
+
+    base_intent = enriched_intent.get("base_intent", "")
+    polarity = enriched_intent.get("polarity", "neutral")
+    comparison_type = enriched_intent.get("comparison_type", "none")
+    temporal_focus = enriched_intent.get("temporal_focus", "single_period")
+
+    # Complex intents always use the full model
+    complex_intents = {"comparison", "variation", "composition", "trend", "temporal"}
+    if base_intent in complex_intents:
+        logger.info(
+            f"[select_insight_model] Complex intent '{base_intent}' -> {INSIGHT_MODEL_DEFAULT}"
+        )
+        return INSIGHT_MODEL_DEFAULT
+
+    # Negative polarity requires deeper reasoning
+    if polarity == "negative":
+        logger.info(
+            f"[select_insight_model] Negative polarity -> {INSIGHT_MODEL_DEFAULT}"
+        )
+        return INSIGHT_MODEL_DEFAULT
+
+    # Explicit comparisons require the full model
+    if comparison_type and comparison_type != "none":
+        logger.info(
+            f"[select_insight_model] Comparison type '{comparison_type}' -> {INSIGHT_MODEL_DEFAULT}"
+        )
+        return INSIGHT_MODEL_DEFAULT
+
+    # Multi-period temporal analysis requires the full model
+    complex_temporal = {"period_over_period", "time_series", "seasonality"}
+    if temporal_focus in complex_temporal:
+        logger.info(
+            f"[select_insight_model] Temporal focus '{temporal_focus}' -> {INSIGHT_MODEL_DEFAULT}"
+        )
+        return INSIGHT_MODEL_DEFAULT
+
+    # Simple queries: ranking or distribution with single period
+    simple_intents = {"ranking", "distribution"}
+    if base_intent in simple_intents and temporal_focus == "single_period":
+        logger.info(
+            f"[select_insight_model] Simple intent '{base_intent}' + single_period -> {INSIGHT_MODEL_LITE}"
+        )
+        return INSIGHT_MODEL_LITE
+
+    # Default to the full model for safety
+    logger.debug(f"[select_insight_model] Default fallback -> {INSIGHT_MODEL_DEFAULT}")
+    return INSIGHT_MODEL_DEFAULT
+
+
+def load_insight_llm(
+    model_override: Optional[str] = None,
+) -> ChatGoogleGenerativeAI:
+    """
+    Load Google Gemini LLM instance with FASE 3 configuration.
+
+    FASE 3 Updates:
+    - Default model upgraded to gemini-2.5-flash
+    - Temperature reduced to 0.4 for balanced output
+    - Supports model_override for dynamic model selection
+    - JSON mode automatic (response_mime_type="application/json")
+
+    Args:
+        model_override: Optional model name to override the default.
+                       Used by select_insight_model() for dynamic selection.
+
+    Returns:
+        ChatGoogleGenerativeAI: Configured instance with timeout, retry and JSON mode
+    """
+    overrides = {}
+    if model_override:
+        overrides["model"] = model_override
+        logger.info(f"[load_insight_llm] Using model override: {model_override}")
+
+    config = get_insight_config(**overrides)
     return ChatGoogleGenerativeAI(**config.to_gemini_kwargs())

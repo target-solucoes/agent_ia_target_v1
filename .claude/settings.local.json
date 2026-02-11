@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir \"C:\\\\Projects\\\\Target\\\\TargetLabs\\\\IA_Agent\\\\LangGraph\\\\graph_classifier_v1_2_gemini_deploy\\\\agent_ia_chatbot_target\\\\logs\\\\sessions\\\\2026-02-09\\\\outputs\")",
+      "Bash(dir:*)"
+    ]
+  }
+}

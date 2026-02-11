@@ -20,6 +20,8 @@ from src.non_graph_executor.models.llm_loader import load_llm
 from src.non_graph_executor.tools.metadata_cache import MetadataCache
 from src.non_graph_executor.tools.query_executor import QueryExecutor
 from src.non_graph_executor.tools.query_classifier import QueryClassifier
+from src.non_graph_executor.tools.intent_analyzer import IntentAnalyzer
+from src.non_graph_executor.tools.dynamic_query_builder import DynamicQueryBuilder
 from src.non_graph_executor.tools.conversational import ConversationalHandler
 from src.non_graph_executor.utils.output_formatter import OutputFormatter
 from src.shared_lib.utils.logger import setup_logging
@@ -127,20 +129,48 @@ class NonGraphExecutorAgent:
             )
             logger.info("[OK] AliasMapper initialized with case-insensitive matching")
 
+            # IntentAnalyzer: LLM-based semantic intent comprehension (Phase 2)
+            # Uses gemini-2.5-flash (not lite) for more sophisticated reasoning
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            from src.shared_lib.core.config import LLMConfig
+
+            intent_config = LLMConfig(
+                model="gemini-2.5-flash",
+                temperature=0.1,  # Low temperature for deterministic intent analysis
+                max_output_tokens=1500,
+                timeout=20,
+            )
+            intent_llm = ChatGoogleGenerativeAI(**intent_config.to_gemini_kwargs())
+            self.intent_analyzer = IntentAnalyzer(
+                llm=intent_llm,
+                alias_mapper=self.alias_mapper,
+            )
+            logger.info("[OK] IntentAnalyzer initialized (gemini-2.5-flash, temp=0.1)")
+
             classifier_llm = load_llm(
                 temperature=0.3,
                 max_output_tokens=800,  # Classification + parameter extraction
             )
             self.query_classifier = QueryClassifier(
-                llm=classifier_llm, alias_mapper=self.alias_mapper
+                llm=classifier_llm,
+                alias_mapper=self.alias_mapper,
+                intent_analyzer=self.intent_analyzer,
+                use_intent_analyzer=True,
             )
-            logger.info("[OK] QueryClassifier initialized")
+            logger.info("[OK] QueryClassifier initialized with IntentAnalyzer")
 
             # Phase 2.2: Query Executor (now with alias_mapper for type-aware filtering)
             self.query_executor = QueryExecutor(
                 self.data_source, self.metadata_cache, self.alias_mapper
             )
             logger.info("[OK] QueryExecutor initialized")
+
+            # Phase 3.1: Dynamic Query Builder
+            self.dynamic_query_builder = DynamicQueryBuilder(
+                alias_mapper=self.alias_mapper,
+                data_source=self.data_source,
+            )
+            logger.info("[OK] DynamicQueryBuilder initialized")
 
             # Phase 2.3: Conversational Handler with LLM
             conversational_llm = load_llm(
@@ -305,9 +335,26 @@ class NonGraphExecutorAgent:
                     perf.start_times["llm"] = perf.start_times["classification"]
                     perf.timings["llm"] = perf.timings["classification"]
 
-            result_data, result_metadata = self._execute_by_type(
-                classification=classification, filters=filters, perf=perf
-            )
+            # Determine execution path:
+            # - Dynamic path: Use DynamicQueryBuilder when QueryIntent is available
+            #   and the intent type benefits from dynamic SQL (aggregations with
+            #   GROUP BY, rankings, temporal analysis, comparisons).
+            # - Legacy path: Use _execute_by_type for simple types (metadata,
+            #   tabular, conversational, lookup) or when no intent is available.
+            intent = getattr(classification, "intent", None)
+            use_dynamic = self._should_use_dynamic_path(classification, intent)
+
+            if use_dynamic:
+                result_data, result_metadata = self._execute_dynamic(
+                    intent=intent,
+                    filters=filters,
+                    query=query,
+                    perf=perf,
+                )
+            else:
+                result_data, result_metadata = self._execute_by_type(
+                    classification=classification, filters=filters, perf=perf
+                )
 
             # Enrich metadata with filtered_dataset_row_count
             result_metadata = self._enrich_metadata_with_dataset_row_count(
@@ -403,6 +450,169 @@ class NonGraphExecutorAgent:
 
         return metadata
 
+    def _should_use_dynamic_path(self, classification, intent) -> bool:
+        """
+        Determina se a query deve usar o fluxo dinâmico (DynamicQueryBuilder).
+
+        O fluxo dinâmico é usado quando:
+        1. Há um QueryIntent disponível (do IntentAnalyzer)
+        2. O intent_type se beneficia de SQL dinâmico (agregações com GROUP BY,
+           rankings, análise temporal, comparações)
+
+        O fluxo legacy é mantido para:
+        - metadata (row_count, column_list, etc.) → usa MetadataCache
+        - tabular → usa get_tabular_data direto
+        - conversational → já tratado antes deste ponto
+        - lookup → usa lookup_record direto
+        - textual → usa text_search direto
+        - statistical → usa get_descriptive_stats direto
+        - queries sem intent (fallback legacy)
+
+        Args:
+            classification: QueryTypeClassification resultado
+            intent: QueryIntent do IntentAnalyzer (ou None)
+
+        Returns:
+            True se deve usar fluxo dinâmico
+        """
+        if intent is None:
+            return False
+
+        # Tipos de intent que se beneficiam do fluxo dinâmico
+        dynamic_intent_types = {
+            "simple_aggregation",
+            "grouped_aggregation",
+            "ranking",
+            "temporal_analysis",
+            "comparison",
+        }
+
+        return intent.intent_type in dynamic_intent_types
+
+    def _execute_dynamic(
+        self,
+        intent,
+        filters: Dict[str, Any],
+        query: str,
+        perf: PerformanceMonitor,
+    ) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Executa query usando o fluxo dinâmico (Phase 3).
+
+        Fluxo:
+        1. DynamicQueryBuilder.build_query(intent, filters) → SQL string
+        2. QueryExecutor.execute_dynamic_query(sql) → data
+        3. Retorna data + metadata estruturado
+
+        Este método substitui _execute_by_type para queries analíticas
+        que possuem um QueryIntent rico (com GROUP BY, ORDER BY, etc.).
+
+        Args:
+            intent: QueryIntent do IntentAnalyzer
+            filters: Filtros da sessão (filter_final)
+            query: Query original do usuário (para logging/metadata)
+            perf: PerformanceMonitor para tracking
+
+        Returns:
+            Tuple (data, metadata):
+                - data: Lista de dicts com resultados
+                - metadata: Dict com metadados da execução
+
+        Raises:
+            Exception: Se erro na construção ou execução da query
+        """
+        logger.info(
+            f"[NonGraphExecutor] Using DYNAMIC execution path "
+            f"(intent_type={intent.intent_type})"
+        )
+
+        try:
+            # Step 1: Validate intent
+            warnings = self.dynamic_query_builder.validate_intent(intent)
+            if warnings:
+                logger.warning(
+                    f"[NonGraphExecutor] Intent validation warnings: {warnings}"
+                )
+
+            # Step 2: Build SQL from intent
+            sql = self.dynamic_query_builder.build_query(
+                intent=intent,
+                filters=filters if filters else None,
+            )
+
+            # Step 3: Execute dynamic query
+            result_data = self.query_executor.execute_dynamic_query(sql)
+
+            # Step 4: Build metadata
+            metadata = {
+                "row_count": len(result_data),
+                "execution_time": perf.timings.get("execution", 0.0),
+                "engine": "DuckDB",
+                "execution_path": "dynamic",
+                "intent_type": intent.intent_type,
+                "sql_query": sql,
+                "filters_applied": filters if filters else {},
+            }
+
+            # Add aggregation info to metadata
+            if intent.aggregations:
+                metadata["aggregations"] = [
+                    {
+                        "function": agg.function,
+                        "column": agg.column.name,
+                        "alias": agg.alias,
+                    }
+                    for agg in intent.aggregations
+                ]
+
+            # Add group_by info to metadata
+            if intent.group_by:
+                metadata["group_by"] = [col.name for col in intent.group_by]
+
+            if intent.order_by:
+                metadata["order_by"] = {
+                    "column": intent.order_by.column,
+                    "direction": intent.order_by.direction,
+                }
+
+            if intent.limit:
+                metadata["limit"] = intent.limit
+
+            logger.info(
+                f"[NonGraphExecutor] Dynamic execution completed: "
+                f"{len(result_data)} rows returned"
+            )
+
+            return result_data, metadata
+
+        except Exception as e:
+            logger.error(
+                f"[NonGraphExecutor] Dynamic execution failed: {e}. "
+                f"Falling back to legacy path.",
+                exc_info=True,
+            )
+            # Fallback: Try to use the old _execute_by_type approach
+            # Build a minimal classification for the fallback
+            from src.non_graph_executor.models.schemas import QueryTypeClassification
+
+            fallback_params = {}
+            if intent.aggregations:
+                agg = intent.aggregations[0]
+                fallback_params["aggregation"] = agg.function
+                fallback_params["column"] = agg.column.name
+                fallback_params["distinct"] = agg.distinct
+
+            fallback_classification = QueryTypeClassification(
+                query_type="aggregation",
+                confidence=0.5,
+                requires_llm=True,
+                parameters=fallback_params,
+            )
+
+            return self._execute_by_type(
+                classification=fallback_classification, filters=filters, perf=perf
+            )
+
     def _execute_by_type(
         self, classification, filters: Dict[str, Any], perf: PerformanceMonitor
     ) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
@@ -490,7 +700,8 @@ class NonGraphExecutorAgent:
                 if not column:
                     raise ValueError("Column name required for unique_count")
 
-                count = self.query_executor.count_unique_values(column, filters)
+                unique_values = self.query_executor.list_unique_values(column, filters)
+                count = len(unique_values)
                 data = [{"column": column, "unique_count": count}]
                 metadata = {
                     "row_count": 0,
@@ -615,7 +826,7 @@ class NonGraphExecutorAgent:
                 if not column or not search_term:
                     raise ValueError("Column and search_term required for text search")
 
-                results = self.query_executor.text_search(
+                results = self.query_executor.search_text(
                     column=column,
                     search_term=search_term,
                     case_sensitive=case_sensitive,
@@ -640,7 +851,7 @@ class NonGraphExecutorAgent:
             if not column:
                 raise ValueError("Column name required for statistical analysis")
 
-            stats = self.query_executor.get_descriptive_stats(column, filters)
+            stats = self.query_executor.compute_descriptive_stats(column, filters)
             data = [stats]
             metadata = {
                 "row_count": 1,

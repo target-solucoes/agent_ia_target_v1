@@ -56,6 +56,14 @@ class InsightState(TypedDict, total=False):
     Used for metric calculations.
     """
 
+    # ========== USER CONTEXT (FASE 1) ==========
+    user_query: Optional[str]
+    """
+    Original user query extracted from chart_spec or analytics_result.
+    Used by build_prompt_node (FASE 1) to inject the user's question into the
+    LLM prompt so the response directly addresses their intent.
+    """
+
     # ========== INTERMEDIATE (processing) ==========
     chart_type: str
     """
@@ -112,10 +120,39 @@ class InsightState(TypedDict, total=False):
     Built from numeric_summary and chart_type specific template.
     """
 
+    system_prompt: Optional[str]
+    """
+    Dynamic system prompt built by build_system_prompt().
+    FASE 2: Replaces the rigid SYSTEM_PROMPT constant with an
+    intent-driven system message tailored to the user's question.
+    """
+
     llm_response: str
     """
     Raw text response from LLM.
     Contains unstructured insights that need parsing.
+    """
+
+    # ========== FASE 2: INTENTION-DRIVEN OUTPUT ==========
+    resposta: Optional[str]
+    """
+    FASE 2: Primary LLM response text addressing the user's question directly.
+    This is the main content the user sees. May contain markdown formatting
+    (bold, lists, tables). Replaces the rigid 4-section structure.
+    """
+
+    dados_destacados: Optional[List[str]]
+    """
+    FASE 2: Key data points highlighted in the analysis (3-5 items).
+    Each item contains a concrete finding with values.
+    Example: ["Loja A lidera com R$ 1.2M (32% do total)", "Gap de 45% entre 1º e 2º"]
+    """
+
+    filtros_mencionados: Optional[List[str]]
+    """
+    FASE 2: Filters mentioned/contextualized in the response.
+    Tracks which active filters were referenced in the narrative.
+    Example: ["Santa Catarina", "Janeiro a Março 2024"]
     """
 
     # ========== OUTPUT (final results - FASE 4 UNIFIED) ==========

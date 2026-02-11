@@ -34,6 +34,21 @@ class AliasMapper:
     various matching strategies.
     """
 
+    # =========================================================================
+    # VIRTUAL COLUMN REGISTRY
+    # =========================================================================
+    # Colunas que não existem fisicamente no dataset, mas são derivadas de
+    # colunas reais via expressões DuckDB. O AliasMapper resolve aliases como
+    # "ano" -> "Ano", porém "Ano" não é uma coluna física — requer YEAR("Data").
+    # Este registro permite que componentes downstream (QueryExecutor, etc.)
+    # detectem colunas virtuais e obtenham a expressão SQL correspondente.
+    # =========================================================================
+    VIRTUAL_COLUMN_MAP: Dict[str, str] = {
+        "Ano": 'YEAR("Data")',
+        "Mes": 'MONTH("Data")',
+        "Nome_Mes": 'MONTHNAME("Data")',
+    }
+
     def __init__(
         self,
         alias_path: str = ALIAS_PATH,
@@ -495,6 +510,52 @@ class AliasMapper:
         metrics = self.aliases.get("metrics", {})
 
         return column in vendas_columns or column in metrics
+
+    # =========================================================================
+    # VIRTUAL COLUMN METHODS
+    # =========================================================================
+
+    def is_virtual_column(self, column_name: str) -> bool:
+        """
+        Verifica se uma coluna é virtual (derivada de outra coluna via expressão SQL).
+
+        Colunas virtuais como "Ano" e "Mes" são mapeadas pelo alias.yaml mas não
+        existem fisicamente no dataset. Elas requerem expressões DuckDB como
+        YEAR("Data") ou MONTH("Data") para serem utilizadas em queries.
+
+        Args:
+            column_name: Nome da coluna a verificar
+
+        Returns:
+            True se a coluna é virtual, False caso contrário
+
+        Example:
+            >>> mapper.is_virtual_column("Ano")
+            True
+            >>> mapper.is_virtual_column("Valor_Vendido")
+            False
+        """
+        return column_name in self.VIRTUAL_COLUMN_MAP
+
+    def get_virtual_expression(self, column_name: str) -> Optional[str]:
+        """
+        Obtém a expressão DuckDB equivalente para uma coluna virtual.
+
+        Args:
+            column_name: Nome da coluna virtual
+
+        Returns:
+            Expressão SQL DuckDB correspondente, ou None se não for virtual
+
+        Example:
+            >>> mapper.get_virtual_expression("Ano")
+            'YEAR("Data")'
+            >>> mapper.get_virtual_expression("Mes")
+            'MONTH("Data")'
+            >>> mapper.get_virtual_expression("Valor_Vendido")
+            None
+        """
+        return self.VIRTUAL_COLUMN_MAP.get(column_name)
 
     def clear_cache(self):
         """Clear the resolution cache."""

@@ -19,12 +19,8 @@ from typing import Dict, Any, List
 
 from ..parsers.input_parser import InputParser
 from ..handlers.registry import get_handler, is_chart_type_supported
-from ..generators.executive_summary import ExecutiveSummaryGenerator
-from ..generators.insight_synthesizer import InsightSynthesizer
-from ..generators.next_steps_generator import NextStepsGenerator
 from ..formatters.data_table_formatter import DataTableFormatter
 from ..formatters.output_assembler import OutputAssembler
-from ..models.llm_loader import get_shared_llm
 from ..graph.state import FormatterState
 
 logger = logging.getLogger(__name__)
@@ -600,7 +596,14 @@ def assemble_output_node(state: FormatterState) -> Dict[str, Any]:
         next_steps = state.get("next_steps", {})
         formatted_table = state.get("formatted_data_table", {})
 
-        # Aggregate tokens from 3 generators
+        # FASE 3: Extract FASE 2 native fields from insight_result
+        # These are the primary response fields; formatter passes them through
+        insight_result = parsed_inputs.get("insight_result", {})
+        resposta = insight_result.get("resposta", "")
+        dados_destacados = insight_result.get("dados_destacados", [])
+        filtros_mencionados = insight_result.get("filtros_mencionados", [])
+
+        # Aggregate tokens from upstream agents (no LLM calls in formatter since FASE 4)
         from src.formatter_agent.utils.token_accumulator import TokenAccumulator
 
         accumulator = TokenAccumulator()
@@ -665,6 +668,12 @@ def assemble_output_node(state: FormatterState) -> Dict[str, Any]:
             agent_tokens=state.get("agent_tokens", {}),
             total_tokens=total_tokens,
         )
+
+        # FASE 3: Pass through FASE 2 native fields as primary response
+        # insight_result.resposta IS the final user-facing answer
+        formatter_output["resposta"] = resposta
+        formatter_output["dados_destacados"] = dados_destacados
+        formatter_output["filtros_mencionados"] = filtros_mencionados
 
         execution_time = time.time() - start_time
         execution_times["assemble_output"] = execution_time

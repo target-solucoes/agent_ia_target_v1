@@ -1,8 +1,14 @@
 """
 Query classifier for non_graph_executor.
 
-This module implements query classification and parameter extraction
-for non-graph queries using keyword-based detection and LLM fallback.
+This module implements query classification using a hybrid approach:
+1. Fast pre-filter for conversational queries (no LLM needed)
+2. LLM-based IntentAnalyzer for semantic understanding of all other queries
+3. Legacy keyword-based fallback (configurable)
+
+Phase 2 refactoring: The IntentAnalyzer replaces keyword-based classification
+for non-conversational queries, enabling proper handling of GROUP BY,
+ORDER BY, temporal functions, and rankings.
 """
 
 import logging
@@ -11,6 +17,12 @@ import re
 from typing import Dict, Optional, Any
 
 from src.non_graph_executor.models.schemas import QueryTypeClassification
+from src.non_graph_executor.models.intent_schema import (
+    QueryIntent,
+    ColumnSpec,
+    AggregationSpec,
+)
+from src.non_graph_executor.tools.intent_analyzer import IntentAnalyzer
 from src.non_graph_executor.tools.query_classifier_params import ParameterExtractor
 
 logger = logging.getLogger(__name__)
@@ -253,68 +265,83 @@ class QueryClassifier:
     # Saudações simples
     GREETINGS = ["oi", "olá", "ola", "hello", "hi", "bom dia", "boa tarde", "boa noite"]
 
-    def __init__(self, alias_mapper, llm):
+    def __init__(
+        self,
+        alias_mapper,
+        llm,
+        intent_analyzer: Optional[IntentAnalyzer] = None,
+        use_intent_analyzer: bool = True,
+    ):
         """
         Initialize query classifier.
 
         Args:
             alias_mapper: AliasMapper instance for column resolution
-            llm: LLM instance for ambiguous cases
+            llm: LLM instance for ambiguous cases (legacy fallback)
+            intent_analyzer: IntentAnalyzer instance for semantic comprehension
+                (Phase 2). If None and use_intent_analyzer=True, one will be
+                created using the provided llm and alias_mapper.
+            use_intent_analyzer: Whether to use the IntentAnalyzer for
+                semantic classification. Set to False to use legacy
+                keyword-based classification only.
         """
         self.alias_mapper = alias_mapper
         self.llm = llm
-        logger.info("QueryClassifier initialized with keyword-based classification")
+        self.use_intent_analyzer = use_intent_analyzer
+        self.intent_analyzer = intent_analyzer
+
+        if self.use_intent_analyzer and self.intent_analyzer is None:
+            logger.info(
+                "QueryClassifier: No IntentAnalyzer provided, will be set externally"
+            )
+
+        mode = (
+            "IntentAnalyzer (semantic)"
+            if use_intent_analyzer
+            else "keyword-based (legacy)"
+        )
+        logger.info(f"QueryClassifier initialized with {mode} classification")
 
     def classify(self, query: str, state: Dict) -> QueryTypeClassification:
         """
-        Classifica query usando estratégia inteligente e contextual.
+        Classifica query usando estratégia híbrida.
 
-        Ordem de prioridade (refatorada para evitar conflitos):
-        1. TABULAR - Keywords explícitas de tabela
-        2. CONVERSATIONAL - Saudações e ajuda
-        3. METADATA - Estrutura do dataset (exceto com contexto de negócio)
-        4. STATISTICAL - Análises avançadas (separado de aggregation)
-        5. AGGREGATION - Cálculos simples (verificação contextual)
-        6. TEXTUAL - Listagens (verificação contextual)
-        7. LOOKUP - Busca específica (verificação contextual)
-        8. LLM fallback
+        Fluxo de classificação (Phase 2):
+        1. PRE-FILTRO RÁPIDO: Detecta queries conversacionais sem LLM
+        2. INTENT ANALYZER (se habilitado): Compreensão semântica via LLM
+        3. LEGACY FALLBACK: Classificação keyword-based (se IntentAnalyzer falhar
+           ou estiver desabilitado)
+
+        O IntentAnalyzer produz um QueryIntent com informação dimensional
+        completa (group_by, order_by, limit, etc.), que é mapeado para o
+        QueryTypeClassification existente para manter compatibilidade.
 
         Args:
             query: Query do usuário
             state: State do pipeline
 
         Returns:
-            QueryTypeClassification com tipo, confidence e parâmetros
+            QueryTypeClassification com tipo, confidence, parâmetros e intent
         """
         query_lower = query.lower()
 
         # ====================================================================
-        # 1. METADATA com número de linhas - Prioridade sobre TABULAR
-        # "mostre 5 linhas", "primeiras 10 registros" = sample_rows (metadata)
+        # PRE-FILTRO 1: Conversational (sem LLM, muito barato)
         # ====================================================================
-        # Check if query has a specific small number (indicating sample, not full table)
-        sample_match = re.search(
-            r"(mostre|mostrar|exibir|ver|primeiras?|últimas?)\s+(\d+)\s*(linhas|registros|rows)",
-            query_lower,
-        )
-        if sample_match:
-            n = int(sample_match.group(2))
-            if n <= 100:  # Small numbers indicate sample request
-                logger.debug(f"Query classified as METADATA (sample_rows): {query}")
-                return QueryTypeClassification(
-                    query_type="metadata",
-                    subtype="sample_rows",
-                    confidence=0.95,
-                    requires_llm=False,
-                    parameters={"metadata_type": "sample_rows", "n": n},
-                )
+        if self._is_conversational(query, query_lower):
+            logger.debug(f"[QueryClassifier] Pre-filter: CONVERSATIONAL: {query}")
+            return QueryTypeClassification(
+                query_type="conversational",
+                confidence=0.98,
+                requires_llm=True,
+                parameters={},
+            )
 
         # ====================================================================
-        # 2. TABULAR - Prioridade para visualização completa de dados
+        # PRE-FILTRO 2: Tabular explícito (keywords diretos, sem LLM)
         # ====================================================================
         if any(kw in query_lower for kw in self.TABULAR_KEYWORDS):
-            logger.debug(f"Query classified as TABULAR: {query}")
-            # Extract limit if present
+            logger.debug(f"[QueryClassifier] Pre-filter: TABULAR: {query}")
             limit_match = re.search(r"(\d+)\s*(linhas|registros|rows)", query_lower)
             limit = int(limit_match.group(1)) if limit_match else 100
             return QueryTypeClassification(
@@ -325,32 +352,262 @@ class QueryClassifier:
             )
 
         # ====================================================================
-        # 2. CONVERSATIONAL - Saudações e ajuda
+        # PRE-FILTRO 3: Sample rows explícito (metadata com número)
         # ====================================================================
-        if self._is_conversational(query, query_lower):
-            logger.debug(f"Query classified as CONVERSATIONAL: {query}")
-            return QueryTypeClassification(
-                query_type="conversational",
-                confidence=0.98,
-                requires_llm=True,
-                parameters={},
-            )
+        sample_match = re.search(
+            r"(mostre|mostrar|exibir|ver|primeiras?|últimas?)\s+(\d+)\s*(linhas|registros|rows)",
+            query_lower,
+        )
+        if sample_match:
+            n = int(sample_match.group(2))
+            if n <= 100:
+                logger.debug(
+                    f"[QueryClassifier] Pre-filter: METADATA (sample_rows): {query}"
+                )
+                return QueryTypeClassification(
+                    query_type="metadata",
+                    subtype="sample_rows",
+                    confidence=0.95,
+                    requires_llm=False,
+                    parameters={"metadata_type": "sample_rows", "n": n},
+                )
 
         # ====================================================================
-        # 3. METADATA - Estrutura do dataset
-        # Tem prioridade sobre aggregation para perguntas sobre estrutura
+        # INTENT ANALYZER: Compreensão semântica via LLM (Phase 2)
         # ====================================================================
-        # Check for metadata keywords
+        if self.use_intent_analyzer and self.intent_analyzer is not None:
+            try:
+                logger.info(
+                    f"[QueryClassifier] Delegating to IntentAnalyzer: '{query}'"
+                )
+                token_accumulator = state.get("_token_accumulator")
+                filters = state.get("filter_final", {})
+
+                intent = self.intent_analyzer.analyze(
+                    query=query,
+                    filters=filters,
+                    token_accumulator=token_accumulator,
+                )
+
+                # Map QueryIntent → QueryTypeClassification
+                classification = self._map_intent_to_classification(
+                    intent=intent,
+                    query=query,
+                    state=state,
+                )
+
+                logger.info(
+                    f"[QueryClassifier] IntentAnalyzer result: "
+                    f"intent_type={intent.intent_type} → "
+                    f"query_type={classification.query_type} "
+                    f"(confidence={classification.confidence:.2f})"
+                )
+
+                return classification
+
+            except Exception as e:
+                logger.warning(
+                    f"[QueryClassifier] IntentAnalyzer failed, "
+                    f"falling back to legacy: {e}"
+                )
+                # Fall through to legacy classification
+
+        # ====================================================================
+        # LEGACY FALLBACK: Classificação keyword-based
+        # ====================================================================
+        logger.info(f"[QueryClassifier] Using legacy keyword classification: '{query}'")
+        return self._legacy_classify(query, query_lower, state)
+
+    def _map_intent_to_classification(
+        self,
+        intent: QueryIntent,
+        query: str,
+        state: Dict,
+    ) -> QueryTypeClassification:
+        """
+        Mapeia QueryIntent do IntentAnalyzer para QueryTypeClassification.
+
+        Converte o intent_type semântico para o query_type do schema existente
+        e extrai parâmetros compatíveis com o fluxo atual de _execute_by_type.
+
+        Mapeamento:
+        - simple_aggregation → aggregation
+        - grouped_aggregation → aggregation (com intent para Phase 3)
+        - ranking → aggregation (com intent para Phase 3)
+        - temporal_analysis → aggregation (com intent para Phase 3)
+        - comparison → aggregation (com intent para Phase 3)
+        - lookup → lookup
+        - metadata → metadata
+        - tabular → tabular
+        - conversational → conversational
+
+        Args:
+            intent: QueryIntent do IntentAnalyzer
+            query: Query original
+            state: State do pipeline
+
+        Returns:
+            QueryTypeClassification com tipo mapeado e intent anexado
+        """
+        intent_type = intent.intent_type
+
+        # === CONVERSATIONAL ===
+        if intent_type == "conversational":
+            return QueryTypeClassification(
+                query_type="conversational",
+                confidence=intent.confidence,
+                requires_llm=True,
+                parameters={},
+                intent=intent,
+            )
+
+        # === METADATA ===
+        if intent_type == "metadata":
+            params = self._extract_metadata_params(query, query.lower())
+            return QueryTypeClassification(
+                query_type="metadata",
+                confidence=intent.confidence,
+                requires_llm=False,
+                parameters=params,
+                intent=intent,
+            )
+
+        # === TABULAR ===
+        if intent_type == "tabular":
+            limit = intent.limit or 100
+            return QueryTypeClassification(
+                query_type="tabular",
+                confidence=intent.confidence,
+                requires_llm=False,
+                parameters={"limit": limit},
+                intent=intent,
+            )
+
+        # === LOOKUP ===
+        if intent_type == "lookup":
+            params = self._extract_lookup_params(query, state)
+            return QueryTypeClassification(
+                query_type="lookup",
+                confidence=intent.confidence,
+                requires_llm=True,
+                parameters=params,
+                intent=intent,
+            )
+
+        # === AGGREGATION TYPES (simple, grouped, ranking, temporal, comparison) ===
+        # All map to "aggregation" query_type for backward compatibility.
+        # The full QueryIntent is carried via the `intent` field for Phase 3.
+        params = self._extract_params_from_intent(intent, query, state)
+
+        return QueryTypeClassification(
+            query_type="aggregation",
+            confidence=intent.confidence,
+            requires_llm=True,
+            parameters=params,
+            intent=intent,
+        )
+
+    def _extract_params_from_intent(
+        self,
+        intent: QueryIntent,
+        query: str,
+        state: Dict,
+    ) -> Dict[str, Any]:
+        """
+        Extrai parâmetros de agregação a partir do QueryIntent.
+
+        Converte a representação semântica do IntentAnalyzer para os
+        parâmetros esperados pelo _execute_by_type existente:
+        - column: coluna alvo da agregação
+        - aggregation: tipo de função (sum, avg, count, etc.)
+        - distinct: se deve usar DISTINCT
+        - filters: filtros do state
+
+        Args:
+            intent: QueryIntent com análise semântica
+            query: Query original
+            state: State do pipeline
+
+        Returns:
+            Dict com parâmetros compatíveis com o fluxo atual
+        """
+        params: Dict[str, Any] = {}
+
+        if intent.aggregations:
+            agg = intent.aggregations[0]  # Primary aggregation
+            params["aggregation"] = agg.function
+            params["column"] = agg.column.name
+            params["distinct"] = agg.distinct
+
+            # If the column is virtual, note it for QueryExecutor
+            if agg.column.is_virtual and agg.column.expression:
+                params["column_expression"] = agg.column.expression
+                params["column_is_virtual"] = True
+        else:
+            # No aggregations in intent, try to extract from query (legacy)
+            legacy_params = ParameterExtractor.extract_aggregation_params(
+                query, state, self.alias_mapper
+            )
+            params.update(legacy_params)
+
+        # Carry group_by info for future Phase 3
+        if intent.group_by:
+            params["group_by"] = [
+                {
+                    "name": col.name,
+                    "is_virtual": col.is_virtual,
+                    "expression": col.expression,
+                    "alias": col.alias,
+                }
+                for col in intent.group_by
+            ]
+
+        # Carry order_by info for future Phase 3
+        if intent.order_by:
+            params["order_by"] = {
+                "column": intent.order_by.column,
+                "direction": intent.order_by.direction,
+            }
+
+        # Carry limit for future Phase 3
+        if intent.limit is not None:
+            params["limit"] = intent.limit
+
+        # Get filters from state
+        params["filters"] = state.get("filter_final", {})
+
+        return params
+
+    def _legacy_classify(
+        self, query: str, query_lower: str, state: Dict
+    ) -> QueryTypeClassification:
+        """
+        Classificação legacy baseada em keywords (fallback).
+
+        Mantida para backward compatibility e como fallback quando
+        o IntentAnalyzer não está disponível ou falha.
+
+        Ordem de prioridade:
+        1. METADATA - Estrutura do dataset
+        2. STATISTICAL - Análises avançadas
+        3. AGGREGATION - Cálculos simples
+        4. TEXTUAL - Listagens
+        5. LOOKUP - Busca específica
+        6. LLM fallback
+
+        Args:
+            query: Query original
+            query_lower: Query em lowercase
+            state: State do pipeline
+
+        Returns:
+            QueryTypeClassification com tipo, confidence e parâmetros
+        """
+        # METADATA
         if any(kw in query_lower for kw in self.METADATA_KEYWORDS):
-            # EXCEPT: "quantos/quantas" with specific business entity (clientes, produtos, etc)
-            # But "quantas linhas", "quantos registros" are still metadata
             has_business_context = any(
                 kw in query_lower for kw in self.BUSINESS_KEYWORDS
             )
-
-            # Specific metadata terms that override business context
-            # Including "valores únicos" for unique values, "tipos" for data types
-            # But NOT "total de [business]" which is aggregation
             metadata_terms = [
                 "linhas",
                 "registros",
@@ -362,14 +619,12 @@ class QueryClassifier:
                 "valores unicos",
                 "distinct count",
                 "tipos de dados",
-                "tipo das",  # For dtypes
+                "tipo das",
             ]
             has_metadata_terms = any(term in query_lower for term in metadata_terms)
 
-            # If has metadata terms, it's always metadata (even with business keywords)
-            # Otherwise, check if it's "quantos clientes" (aggregation) vs "quantas linhas" (metadata)
-            if has_metadata_terms:
-                logger.debug(f"Query classified as METADATA: {query}")
+            if has_metadata_terms or not has_business_context:
+                logger.debug(f"[Legacy] Query classified as METADATA: {query}")
                 params = self._extract_metadata_params(query, query_lower)
                 return QueryTypeClassification(
                     query_type="metadata",
@@ -377,23 +632,10 @@ class QueryClassifier:
                     requires_llm=False,
                     parameters=params,
                 )
-            elif not has_business_context:
-                # No business context, definitely metadata
-                logger.debug(f"Query classified as METADATA: {query}")
-                params = self._extract_metadata_params(query, query_lower)
-                return QueryTypeClassification(
-                    query_type="metadata",
-                    confidence=0.90,
-                    requires_llm=False,
-                    parameters=params,
-                )
-            # else: has business but no metadata terms → fall through to AGGREGATION
 
-        # ====================================================================
-        # 4. STATISTICAL - Análises avançadas (antes de aggregation)
-        # ====================================================================
+        # STATISTICAL
         if any(kw in query_lower for kw in self.STATISTICAL_KEYWORDS):
-            logger.debug(f"Query classified as STATISTICAL: {query}")
+            logger.debug(f"[Legacy] Query classified as STATISTICAL: {query}")
             params = self._extract_statistical_params(query, state)
             return QueryTypeClassification(
                 query_type="statistical",
@@ -402,11 +644,9 @@ class QueryClassifier:
                 parameters=params,
             )
 
-        # ====================================================================
-        # 5. AGGREGATION - Cálculos simples com verificação contextual
-        # ====================================================================
+        # AGGREGATION
         if self._is_aggregation(query_lower):
-            logger.debug(f"Query classified as AGGREGATION: {query}")
+            logger.debug(f"[Legacy] Query classified as AGGREGATION: {query}")
             params = self._extract_aggregation_params(query, state)
             return QueryTypeClassification(
                 query_type="aggregation",
@@ -415,11 +655,9 @@ class QueryClassifier:
                 parameters=params,
             )
 
-        # ====================================================================
-        # 6. TEXTUAL - Listagens com verificação contextual
-        # ====================================================================
+        # TEXTUAL
         if self._is_textual(query_lower):
-            logger.debug(f"Query classified as TEXTUAL: {query}")
+            logger.debug(f"[Legacy] Query classified as TEXTUAL: {query}")
             params = self._extract_textual_params(query, state)
             return QueryTypeClassification(
                 query_type="textual",
@@ -428,11 +666,9 @@ class QueryClassifier:
                 parameters=params,
             )
 
-        # ====================================================================
-        # 7. LOOKUP - Busca específica com verificação contextual
-        # ====================================================================
+        # LOOKUP
         if self._is_lookup(query_lower):
-            logger.debug(f"Query classified as LOOKUP: {query}")
+            logger.debug(f"[Legacy] Query classified as LOOKUP: {query}")
             params = self._extract_lookup_params(query, state)
             return QueryTypeClassification(
                 query_type="lookup",
@@ -441,10 +677,8 @@ class QueryClassifier:
                 parameters=params,
             )
 
-        # ====================================================================
-        # 8. LLM Fallback
-        # ====================================================================
-        logger.debug(f"No keyword match, using LLM fallback for: {query}")
+        # LLM Fallback
+        logger.debug(f"[Legacy] No keyword match, using LLM fallback for: {query}")
         return self._llm_classify(query, state)
 
     def _is_aggregation(self, query_lower: str) -> bool:

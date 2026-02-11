@@ -1,414 +1,169 @@
 """
-Prompt builder for generating LLM prompts based on chart type and numeric summaries.
+Prompt builder for generating intention-driven LLM prompts.
 
-This module contains the system prompt and template functions for building
-context-specific prompts for insight generation.
+FASE 2 Implementation: Replaces rigid chart-type templates with dynamic,
+intent-driven prompt construction. The LLM receives the user's question,
+real data, and contextual guidance based on enriched intent rather than
+chart type, enabling adaptive responses that directly address user needs.
+
+Key changes from legacy:
+    - Removed rigid SYSTEM_PROMPT (177-line fixed structure)
+    - Removed CHART_TYPE_TEMPLATES (8 chart-type templates)
+    - Response format is flexible JSON with 'resposta' as primary field
+    - Intent-based guidelines replace chart-type templates
+    - Simplified metric formatting (no academic metrics)
 """
 
-from typing import Dict, Any
+import logging
+from typing import Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT = """Você é um analista de dados especializado em gerar insights estratégicos executivos completos.
+# ============================================================================
+# Intent → Guideline mapping (replaces CHART_TYPE_TEMPLATES)
+# ============================================================================
 
-═══════════════════════════════════════════════════════════════════════════════
-FASE 4 - LLM CALL UNIFICATION: GERAÇÃO COMPLETA DE INSIGHTS
-═══════════════════════════════════════════════════════════════════════════════
-
-Você deve gerar UM ÚNICO JSON contendo TODOS os componentes do relatório analítico:
-1. Executive Summary (título + introdução contextual)
-2. Detailed Insights (5 insights estruturados com fórmulas transparentes)
-3. Synthesized Insights (narrative + key_findings)
-4. Next Steps (3 recomendações estratégicas)
-
-═══════════════════════════════════════════════════════════════════════════════
-REGRA 1: FORMATO DE RESPOSTA - JSON COMPLETO ESTRUTURADO
-═══════════════════════════════════════════════════════════════════════════════
-
-Retorne APENAS um JSON válido com a seguinte estrutura EXATA:
-
-{
-  "executive_summary": {
-    "title": "Título Profissional da Análise (max 80 caracteres)",
-    "introduction": "Parágrafo introdutório contextual de 2-3 frases (50-300 caracteres)"
-  },
-  "detailed_insights": [
-    {
-      "title": "Título Executivo do Insight",
-      "formula": "Fórmula completa com valores numéricos",
-      "interpretation": "Implicação estratégica concisa (max 150 caracteres)"
-    }
-  ],
-  "synthesized_insights": {
-    "narrative": "Narrativa coesa conectando os insights principais (400-800 caracteres)",
-    "key_findings": [
-      "Bullet point 1 conciso (max 140 caracteres)",
-      "Bullet point 2 conciso (max 140 caracteres)",
-      "Bullet point 3 conciso (max 140 caracteres)"
-    ]
-  },
-  "next_steps": {
-    "recommendations": [
-      "Recomendação estratégica 1 acionável (max 200 caracteres)",
-      "Recomendação estratégica 2 acionável (max 200 caracteres)",
-      "Recomendação estratégica 3 acionável (max 200 caracteres)"
-    ]
-  }
+INTENT_GUIDELINES: Dict[str, str] = {
+    "ranking": (
+        "Liste os itens em ordem, com valores. "
+        "Identifique líderes e gaps entre posições consecutivas."
+    ),
+    "trend": (
+        "Descreva a evolução cronológica. Destaque picos, vales e tendências gerais."
+    ),
+    "temporal": (
+        "Descreva a evolução cronológica. Destaque picos, vales e tendências gerais."
+    ),
+    "comparison": (
+        "Compare explicitamente os elementos. Use diferenças absolutas e percentuais."
+    ),
+    "distribution": (
+        "Identifique os dominantes e suas participações. "
+        "Destaque concentração e proporções."
+    ),
+    "composition": (
+        "Descreva a composição por componente. Identifique padrões e desequilíbrios."
+    ),
+    "variation": (
+        "Foque nas mudanças. Ranking de maiores variações (positivas ou negativas)."
+    ),
 }
 
-═══════════════════════════════════════════════════════════════════════════════
-REGRA 2: EXECUTIVE SUMMARY - Contextualização Profissional
-═══════════════════════════════════════════════════════════════════════════════
-
-**title**: 
-- Máximo 80 caracteres
-- Capture a essência da análise
-- Linguagem profissional e direta
-- Mencione a dimensão analisada e contexto
-
-**introduction**:
-- 50-300 caracteres (2-3 frases)
-- OBRIGATÓRIO: Mencione TODOS os filtros aplicados em **negrito** (markdown bold)
-- Se há filtros no contexto, eles DEVEM aparecer explicitamente na introduction
-- Formato: "Esta análise examina ... para **Ano: 2016**, **Região: Sul**, **Produto: X** ..."
-- Tom executivo e objetivo
-- Prepare o leitor para os insights
-
-EXEMPLOS:
-✓ title: "Análise de Ranking de Produtos por Faturamento em SP - 2016"
-✓ introduction: "Esta análise examina o desempenho de vendas para **Região: São Paulo** no **Período: 2016**, identificando concentrações críticas e oportunidades estratégicas."
-
-ANTI-EXEMPLOS (NUNCA FAÇA para introduction):
-✗ "Esta análise examina o desempenho..." (sem mencionar filtros)
-✗ "Análise para São Paulo em 2016" (filtros sem bold)
-
-═══════════════════════════════════════════════════════════════════════════════
-REGRA 3: DETAILED INSIGHTS - Transparência Total com Fórmulas
-═══════════════════════════════════════════════════════════════════════════════
-
-Gere EXATAMENTE 5 insights estruturados.
-
-Cada insight DEVE conter:
-- **title**: Título executivo claro
-- **formula**: Fórmula COMPLETA com valores numéricos e operadores
-- **interpretation**: 1-2 frases sobre implicação estratégica (max 150 caracteres)
-
-EXEMPLOS CORRETOS de fórmulas:
-✓ "Top 3 = R$ 8,66M / Total R$ 12,68M → 68,3%"
-✓ "Gap = Líder - Segundo = R$ 3,4M - R$ 2,1M = R$ 1,3M (62% maior)"
-✓ "Variação = (Final - Inicial) / Inicial = (450 - 300) / 300 = +50%"
-✓ "Amplitude = Max - Min = 500 - 100 = 400"
-
-ANTI-EXEMPLOS (NUNCA FAÇA):
-✗ "Top 3 representa 68,3%" (sem valores base)
-✗ "O líder tem 62% a mais" (sem fórmula completa)
-✗ "Crescimento de 50%" (sem cálculo explícito)
-
-═══════════════════════════════════════════════════════════════════════════════
-REGRA 4: SYNTHESIZED INSIGHTS - Narrativa Coesa e Key Findings
-═══════════════════════════════════════════════════════════════════════════════
-
-**narrative**:
-- 400-800 caracteres (parágrafo executivo)
-- Conecte os insights principais em uma narrativa fluida
-- Use linguagem natural, não telegráfica
-- TODA métrica mencionada DEVE ter correspondência em detailed_insights
-- Sem emojis
-
-**key_findings**:
-- Exatamente 3-5 bullet points
-- Máximo 140 caracteres cada
-- Conciso, acionável e com valores concretos
-- Priorize insights mais estratégicos
-
-EXEMPLO de narrative:
-"A análise revela concentração extrema nos principais produtos, com o Top 3 representando 68,3% do faturamento total. O líder mantém vantagem de 62% sobre o segundo colocado, criando barreira competitiva significativa. Produtos fora do Top 10 apresentam oportunidades de crescimento inexploradas."
-
-EXEMPLO de key_findings:
-[
-  "Top 3 produtos concentram 68,3% da receita → dependência crítica",
-  "Líder com vantagem de 62% sobre segundo → posição defensável",
-  "Cauda longa com potencial inexplorado → oportunidade de diversificação"
-]
-
-═══════════════════════════════════════════════════════════════════════════════
-REGRA 5: NEXT STEPS - Recomendações Estratégicas Acionáveis
-═══════════════════════════════════════════════════════════════════════════════
-
-**recommendations**:
-- Exatamente 3 recomendações estratégicas
-- Máximo 200 caracteres cada
-- Diretas, acionáveis e contextualizadas aos insights
-- Foco em ação executiva (investigar, desenvolver, estabelecer)
-
-EXEMPLOS:
-[
-  "Investigar causas da concentração nos Top 3 e desenvolver estratégias de retenção para mitigar risco de dependência",
-  "Avaliar oportunidades de crescimento nos produtos de menor performance para reduzir concentração",
-  "Estabelecer monitoramento contínuo dos top performers para identificar mudanças de padrão rapidamente"
-]
-
-═══════════════════════════════════════════════════════════════════════════════
-REGRA 6: ALINHAMENTO E CONSISTÊNCIA
-═══════════════════════════════════════════════════════════════════════════════
-
-INVARIANTES OBRIGATÓRIAS:
-- [ ] Toda métrica citada em narrative APARECE em detailed_insights
-- [ ] Valores numéricos são consistentes entre seções
-- [ ] key_findings derivam dos detailed_insights
-- [ ] next_steps são contextualizados aos insights identificados
-- [ ] Zero emojis em todo o output
-- [ ] JSON válido e bem formatado
-
-═══════════════════════════════════════════════════════════════════════════════
-CHECKLIST FINAL DE VALIDAÇÃO
-═══════════════════════════════════════════════════════════════════════════════
-
-Antes de retornar, valide:
-- [ ] JSON válido com todas as 4 seções principais
-- [ ] executive_summary tem title (≤80) e introduction (50-300)
-- [ ] detailed_insights tem EXATAMENTE 5 itens com title, formula, interpretation
-- [ ] Todas as fórmulas contêm operadores (=, /, -, +, →) e valores numéricos
-- [ ] synthesized_insights tem narrative (400-800) e key_findings (3-5 itens)
-- [ ] Cada key_finding tem ≤140 caracteres
-- [ ] next_steps tem exatamente 3 recommendations (≤200 cada)
-- [ ] Alinhamento: métricas em narrative ↔ detailed_insights
-
-═══════════════════════════════════════════════════════════════════════════════
-"""
-
-
-# Templates por chart type com few-shot examples
-CHART_TYPE_TEMPLATES = {
-    "bar_horizontal": """
-═══════════════════════════════════════════════════════════════════════════════
-ANÁLISE DE RANKING
-═══════════════════════════════════════════════════════════════════════════════
-
-DADOS DISPONÍVEIS:
-{dados}
-
-CONTEXTO DA ANÁLISE:
-- Tipo: Ranking de desempenho
-- Foco: Concentração, gap competitivo, distribuição de poder
-- Prioridade: Identificar dependências críticas e oportunidades
-
-INSTRUÇÕES ESPECÍFICAS PARA DETAILED_INSIGHTS:
-Gere 5 insights focados em:
-1. Concentração de poder (Top N vs universo total com fórmula explícita)
-2. Gap competitivo entre líder e demais (cálculo absoluto e relativo)
-3. Oportunidades na cauda (itens fora do Top N)
-4. Riscos de dependência crítica (análise de exposição)
-5. Dinâmica competitiva e projeções estratégicas
-
-EXEMPLO COMPLETO DE OUTPUT:
-{{
-  "executive_summary": {{
-    "title": "Análise de Ranking: Concentração e Oportunidades Estratégicas",
-    "introduction": "Esta análise examina a distribuição de desempenho entre os principais itens do ranking, identificando concentrações críticas que representam riscos operacionais e oportunidades de diversificação."
-  }},
-  "detailed_insights": [
-    {{
-      "title": "Concentração Extrema no Top 3",
-      "formula": "Top 3 = R$ 8,66M / Total R$ 12,68M → 68,3%",
-      "interpretation": "Dependência crítica. Risco de perda de 68% da receita se Top 3 apresentar retração."
-    }},
-    {{
-      "title": "Gap Competitivo Insuperável",
-      "formula": "Gap = Líder - Segundo = R$ 3,4M - R$ 2,1M = R$ 1,3M (62% maior)",
-      "interpretation": "Vantagem competitiva robusta do líder. Difícil de reverter no curto prazo."
-    }},
-    {{
-      "title": "Cauda Longa Subutilizada",
-      "formula": "Itens fora Top 10 = R$ 2,5M / Total R$ 12,68M → 19,7%",
-      "interpretation": "Oportunidade de crescimento inexplorada. Diversificação reduziria dependência."
-    }},
-    {{
-      "title": "Risco de Exposição Elevado",
-      "formula": "Líder = R$ 3,4M / Total R$ 12,68M → 26,8% de dependência",
-      "interpretation": "Exposição individual crítica. Perda do líder impactaria mais de 1/4 do total."
-    }},
-    {{
-      "title": "Dinâmica Competitiva Estável",
-      "formula": "CV (Top 5) = Desvio / Média = 0,45 (moderado)",
-      "interpretation": "Dispersão moderada indica estabilidade. Posições consolidadas com baixa volatilidade."
-    }}
-  ],
-  "synthesized_insights": {{
-    "narrative": "A análise revela concentração extrema, com os Top 3 itens representando 68,3% do total. O líder mantém vantagem significativa de 62% sobre o segundo colocado, criando barreira competitiva robusta. Os itens fora do Top 10 representam apenas 19,7% do total, indicando oportunidades de crescimento inexploradas que poderiam reduzir a dependência crítica dos principais performers.",
-    "key_findings": [
-      "Top 3 concentram 68,3% do total → dependência crítica com risco operacional elevado",
-      "Líder com vantagem de 62% sobre segundo → posição defensável e estável",
-      "Cauda longa com 19,7% → oportunidade de diversificação subutilizada"
-    ]
-  }},
-  "next_steps": {{
-    "recommendations": [
-      "Investigar causas da concentração no Top 3 e desenvolver estratégias de retenção para mitigar risco de dependência crítica",
-      "Avaliar oportunidades de crescimento nos itens de menor performance para reduzir concentração e aumentar resiliência",
-      "Estabelecer monitoramento contínuo dos top performers para identificar mudanças de padrão e antecipar riscos"
-    ]
-  }}
-}}
-""",
-    "bar_vertical": """
-DADOS DE COMPARAÇÃO:
-{dados}
-
-EXEMPLO DE OUTPUT ESPERADO:
-{{
-  "insights": [
-    {{
-      "title": "Amplitude Significativa",
-      "formula": "Amplitude = Max - Min = R$ 500K - R$ 100K = R$ 400K",
-      "interpretation": "Dispersão de 80% indica heterogeneidade. Oportunidade de equalização."
-    }}
-  ]
-}}
-
-GERE 5 INSIGHTS JSON SOBRE:
-1. Amplitude de variação entre categorias
-2. Análise de extremos (máximo vs mínimo)
-3. Dispersão relativa à média
-4. Padrões de distribuição identificados
-5. Implicações estratégicas
-""",
-    "bar_vertical_composed": """
-DADOS DE COMPARAÇÃO MULTI-SÉRIES:
-{dados}
-
-EXEMPLO DE OUTPUT ESPERADO:
-{{
-  "insights": [
-    {{
-      "title": "Série Dominante Identificada",
-      "formula": "Série A = R$ 5,2M / Total R$ 8,0M → 65% de dominância",
-      "interpretation": "Série A lidera com folga. Outras séries têm potencial subutilizado."
-    }}
-  ]
-}}
-
-GERE 5 INSIGHTS JSON SOBRE:
-1. Série dominante e seu peso relativo
-2. Variabilidade entre séries (CV, desvio)
-3. Correlações identificadas entre séries
-4. Dinâmica competitiva multi-série
-5. Oportunidades de balanceamento
-""",
-    "bar_vertical_stacked": """
-DADOS DE COMPOSIÇÃO EMPILHADA:
-{dados}
-
-EXEMPLO DE OUTPUT ESPERADO:
-{{
-  "insights": [
-    {{
-      "title": "Composição Desequilibrada",
-      "formula": "Componente X = R$ 3,5M / Total Stack R$ 5,0M → 70%",
-      "interpretation": "Componente X domina a composição. Risco de concentração elevado."
-    }}
-  ]
-}}
-
-GERE 5 INSIGHTS JSON SOBRE:
-1. Composição total e contribuição por componente
-2. Contribuição percentual de cada stack
-3. Padrões de empilhamento identificados
-4. Análise de participação relativa
-5. Recomendações estratégicas de rebalanceamento
-""",
-    "line": """
-DADOS TEMPORAIS:
-{dados}
-
-EXEMPLO DE OUTPUT ESPERADO:
-{{
-  "insights": [
-    {{
-      "title": "Crescimento Acelerado",
-      "formula": "Variação = (Final - Inicial) / Inicial = (450 - 300) / 300 = +50%",
-      "interpretation": "Crescimento robusto. Tendência indica potencial para continuidade."
-    }}
-  ]
-}}
-
-GERE 5 INSIGHTS JSON SOBRE:
-1. Evolução temporal e variação total
-2. Tendência identificada (crescente/decrescente/estável)
-3. Volatilidade e consistência da série
-4. Pontos de inflexão ou mudanças críticas
-5. Projeção futura e implicações estratégicas
-""",
-    "line_composed": """
-DADOS TEMPORAIS MULTI-SÉRIES:
-{dados}
-
-EXEMPLO DE OUTPUT ESPERADO:
-{{
-  "insights": [
-    {{
-      "title": "Divergência Entre Séries",
-      "formula": "Série A: +40% vs Série B: -15% no período",
-      "interpretation": "Séries divergem fortemente. Série A ganha enquanto B perde market share."
-    }}
-  ]
-}}
-
-GERE 5 INSIGHTS JSON SOBRE:
-1. Evolução comparativa entre séries
-2. Séries divergentes ou convergentes
-3. Correlações temporais identificadas
-4. Liderança ao longo do tempo (mudanças de posição)
-5. Dinâmica competitiva multi-temporal
-""",
-    "pie": """
-DADOS DE DISTRIBUIÇÃO:
-{dados}
-
-EXEMPLO DE OUTPUT ESPERADO:
-{{
-  "insights": [
-    {{
-      "title": "Concentração Alta",
-      "formula": "Top 3 = R$ 6,5M / Total R$ 10,0M → 65%",
-      "interpretation": "Alta concentração indica dependência de poucas categorias. Risco moderado."
-    }}
-  ]
-}}
-
-GERE 5 INSIGHTS JSON SOBRE:
-1. Concentração geral (HHI, Top N)
-2. Categoria dominante e seu peso
-3. Índice de diversificação e equilíbrio
-4. Fragmentação identificada (categorias <5%)
-5. Recomendações de portfolio e diversificação
-""",
-    "histogram": """
-DADOS DE DISTRIBUIÇÃO DE FREQUÊNCIA:
-{dados}
-
-EXEMPLO DE OUTPUT ESPERADO:
-{{
-  "insights": [
-    {{
-      "title": "Distribuição Assimétrica",
-      "formula": "Moda = 150-200 (40% das observações) vs Média = 220",
-      "interpretation": "Assimetria positiva. Maioria concentrada abaixo da média."
-    }}
-  ]
-}}
-
-GERE 5 INSIGHTS JSON SOBRE:
-1. Distribuição de frequências e forma
-2. Concentração modal e picos identificados
-3. Assimetria da distribuição (skewness)
-4. Outliers e valores extremos
-5. Implicações operacionais do padrão de dispersão
-""",
+POLARITY_GUIDANCE: Dict[str, str] = {
+    "positive": "Foque em oportunidades, crescimento e destaques positivos.",
+    "negative": "Foque em riscos, quedas e pontos de atenção.",
+    "neutral": "Apresente panorama geral de forma equilibrada.",
 }
+
+
+# ============================================================================
+# Metrics that should be excluded from simplified prompt (academic/noise)
+# ============================================================================
+
+_EXCLUDED_METRIC_KEYS = {
+    "hhi",
+    "diversidade_pct",
+    "equilibrio",
+    "balanceamento",
+    "coeficiente_variacao",
+    "cv",
+    "shannon",
+    "simpson",
+    "gini",
+    "spread_inicial",
+    "spread_final",
+    "convergencia_pct",
+    "correlacao_media",
+    "score_balanceamento",
+    "diversity_score",
+}
+
+
+# ============================================================================
+# System prompt builder (replaces rigid SYSTEM_PROMPT constant)
+# ============================================================================
+
+
+def build_system_prompt(enriched_intent: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Build a dynamic system prompt based on intent context.
+
+    Instead of a rigid 177-line fixed structure, this generates a concise,
+    intention-driven system message that positions the LLM as a commercial
+    data analyst and defines a flexible response format.
+
+    Args:
+        enriched_intent: Optional enriched intent dict with base_intent,
+                        polarity, narrative_angle, etc.
+
+    Returns:
+        System prompt string
+    """
+    parts = []
+
+    # Core persona and behavioral rules
+    parts.append(
+        "Você é um analista de dados comerciais. "
+        "Responda a pergunta do usuário de forma direta, clara e útil "
+        "para tomada de decisão."
+    )
+
+    parts.append(
+        "\nREGRAS FUNDAMENTAIS:\n"
+        "- Responda a pergunta diretamente na primeira frase.\n"
+        "- Use valores específicos dos dados (nomes, números, percentuais).\n"
+        "- Seja conciso. Não gere seções desnecessárias.\n"
+        "- Não use emojis.\n"
+        "- Linguagem profissional e acessível (evite jargão estatístico).\n"
+        "- Mencione filtros ativos naturalmente no texto quando relevante."
+    )
+
+    # Intent-specific guideline
+    if enriched_intent:
+        base_intent = enriched_intent.get("base_intent", "")
+        guideline = INTENT_GUIDELINES.get(base_intent, "")
+        if guideline:
+            parts.append(f"\nDIRETRIZ DE ANÁLISE:\n{guideline}")
+
+        polarity = enriched_intent.get("polarity", "neutral")
+        polarity_guide = POLARITY_GUIDANCE.get(polarity, "")
+        if polarity_guide:
+            parts.append(f"Tom: {polarity_guide}")
+
+    # Flexible response format (JSON)
+    parts.append(
+        "\nFORMATO DE RESPOSTA:\n"
+        "Retorne APENAS um JSON válido com a seguinte estrutura:\n"
+        "{\n"
+        '  "resposta": "Texto da resposta direta ao usuário. '
+        "Pode incluir texto corrido, listas com marcadores (- item), "
+        'ou tabelas markdown quando fizer sentido para os dados.",\n'
+        '  "dados_destacados": ["dado chave 1 com valor", "dado chave 2 com valor"],\n'
+        '  "filtros_mencionados": ["filtro 1", "filtro 2"]\n'
+        "}\n"
+        "\nDIRETRIZES DE FORMATO:\n"
+        "- Escolha o formato mais adequado à pergunta:\n"
+        "  * Para rankings: liste os itens com valores.\n"
+        "  * Para tendências: descreva a evolução com marcos importantes.\n"
+        "  * Para comparações: destaque diferenças absolutas e percentuais.\n"
+        "  * Para distribuições: identifique dominantes e oportunidades.\n"
+        '- O campo "resposta" é o texto principal que o usuário verá.\n'
+        "- Use negrito (**texto**) para destacar nomes e valores importantes.\n"
+        '- "dados_destacados" deve conter 3-5 descobertas-chave com valores concretos.\n'
+        "- Não gere seções artificiais, recomendações genéricas ou métricas acadêmicas."
+    )
+
+    return "\n".join(parts)
+
+
+# ============================================================================
+# Simplified metric formatting (replaces chart-type-specific formatters)
+# ============================================================================
 
 
 def _format_number(value: float, is_percentage: bool = False) -> str:
-    """Formata numero com separadores de milhares."""
+    """Format number with thousand separators for readability."""
     if is_percentage:
         return f"{value:.2f}%"
     elif abs(value) >= 1_000_000:
@@ -419,374 +174,247 @@ def _format_number(value: float, is_percentage: bool = False) -> str:
         return f"{value:.2f}"
 
 
-def _format_ranking_metrics(metrics: Dict[str, Any]) -> str:
-    """Formata metricas de ranking (bar_horizontal) com formulas explicitas."""
-    lines = []
-
-    # Extrai valores principais
-    total = metrics.get("total", 0)
-    top_n = metrics.get("top_n", 0)
-    sum_top_n = metrics.get("sum_top_n", 0)
-    concentracao_top_n = metrics.get("concentracao_top_n_pct", 0)
-    top3_sum = metrics.get("top3_sum", 0)
-    concentracao_top3 = metrics.get("concentracao_top3_pct", 0)
-    total_items = metrics.get("total_items", 0)
-
-    lider_valor = metrics.get("lider_valor", 0)
-    lider_label = metrics.get("lider_label", "")
-    peso_lider = metrics.get("peso_lider_total_pct", 0)
-
-    segundo_valor = metrics.get("segundo_valor", 0)
-    segundo_label = metrics.get("segundo_label", "")
-    gap_absoluto = metrics.get("gap_absoluto", 0)
-    gap_percentual = metrics.get("gap_percentual", 0)
-
-    # Formata com formulas explicitas
-    if top_n > 0 and total > 0:
-        lines.append(
-            f"Top {top_n} = {_format_number(sum_top_n)} / Total {_format_number(total)} "
-            f"→ {concentracao_top_n:.2f}% ({top_n} itens de {total_items})"
-        )
-
-    if top3_sum > 0 and total > 0:
-        lines.append(
-            f"Top 3 = {_format_number(top3_sum)} / Total {_format_number(total)} "
-            f"→ {concentracao_top3:.2f}%"
-        )
-
-    if lider_valor > 0 and total > 0:
-        lines.append(
-            f"Lider ({lider_label}) = {_format_number(lider_valor)} "
-            f"({peso_lider:.2f}% do total)"
-        )
-
-    if segundo_valor > 0 and gap_absoluto > 0:
-        lines.append(
-            f"Gap competitivo = Lider - Segundo = {_format_number(lider_valor)} - {_format_number(segundo_valor)} "
-            f"= {_format_number(gap_absoluto)} ({gap_percentual:.2f}% maior)"
-        )
-
-    # Adiciona metricas adicionais relevantes
-    tail_sum = metrics.get("tail_sum")
-    tail_pct = metrics.get("tail_pct")
-    if tail_sum is not None and tail_pct is not None:
-        lines.append(
-            f"Cauda (fora Top {top_n}) = {_format_number(tail_sum)} ({tail_pct:.2f}% do total)"
-        )
-
-    # Se nenhuma metrica especifica foi formatada, usa fallback generico
-    if not lines:
-        return _format_generic_metrics(metrics)
-
-    return "\n".join(lines)
-
-
-def _format_temporal_metrics(metrics: Dict[str, Any]) -> str:
-    """Formata metricas temporais (line) com formulas explicitas."""
-    lines = []
-
-    valor_inicial = metrics.get("valor_inicial", 0)
-    valor_final = metrics.get("valor_final", 0)
-    variacao_absoluta = metrics.get("variacao_absoluta", 0)
-    variacao_percentual = metrics.get("variacao_percentual", 0)
-
-    if valor_inicial > 0 and valor_final > 0:
-        lines.append(
-            f"Variacao = (Final - Inicial) / Inicial = "
-            f"({_format_number(valor_final)} - {_format_number(valor_inicial)}) / {_format_number(valor_inicial)} "
-            f"= {_format_number(variacao_absoluta)} ({variacao_percentual:+.2f}%)"
-        )
-
-    tendencia = metrics.get("tendencia")
-    if tendencia:
-        lines.append(f"Tendencia detectada: {tendencia}")
-
-    aceleracao = metrics.get("aceleracao_pct")
-    if aceleracao is not None:
-        lines.append(f"Aceleracao: {aceleracao:+.2f}%")
-
-    max_valor = metrics.get("max_valor")
-    min_valor = metrics.get("min_valor")
-    if max_valor is not None and min_valor is not None:
-        amplitude = max_valor - min_valor
-        lines.append(
-            f"Amplitude = Max - Min = {_format_number(max_valor)} - {_format_number(min_valor)} "
-            f"= {_format_number(amplitude)}"
-        )
-
-    # Adiciona outras metricas numericas
-    for key, value in metrics.items():
-        if key not in [
-            "valor_inicial",
-            "valor_final",
-            "variacao_absoluta",
-            "variacao_percentual",
-            "tendencia",
-            "aceleracao_pct",
-            "max_valor",
-            "min_valor",
-        ]:
-            if (
-                isinstance(value, (int, float))
-                and not key.endswith("_col")
-                and not key.endswith("_label")
-            ):
-                if key.endswith("_pct") or "percentual" in key.lower():
-                    lines.append(f"{key}: {value:.2f}%")
-                else:
-                    lines.append(f"{key}: {_format_number(value)}")
-
-    # Se nenhuma metrica especifica foi formatada, usa fallback generico
-    if not lines:
-        return _format_generic_metrics(metrics)
-
-    return "\n".join(lines)
-
-
-def _format_comparison_metrics(metrics: Dict[str, Any]) -> str:
-    """Formata metricas de comparacao (bar_vertical) com formulas explicitas."""
-    lines = []
-
-    max_valor = metrics.get("max_valor", 0)
-    max_label = metrics.get("max_label", "")
-    min_valor = metrics.get("min_valor", 0)
-    min_label = metrics.get("min_label", "")
-
-    if max_valor > 0 and min_valor >= 0:
-        amplitude = max_valor - min_valor
-        lines.append(
-            f"Amplitude = Max ({max_label}) - Min ({min_label}) = "
-            f"{_format_number(max_valor)} - {_format_number(min_valor)} = {_format_number(amplitude)}"
-        )
-
-    media = metrics.get("media", 0)
-    dispersao_pct = metrics.get("dispersao_pct", 0)
-    if media > 0:
-        lines.append(f"Media: {_format_number(media)}")
-        if dispersao_pct > 0:
-            lines.append(f"Dispersao: {dispersao_pct:.2f}% da media")
-
-    # Adiciona outras metricas
-    for key, value in metrics.items():
-        if key not in [
-            "max_valor",
-            "max_label",
-            "min_valor",
-            "min_label",
-            "media",
-            "dispersao_pct",
-        ]:
-            if (
-                isinstance(value, (int, float))
-                and not key.endswith("_col")
-                and not key.endswith("_label")
-            ):
-                if key.endswith("_pct") or "percentual" in key.lower():
-                    lines.append(f"{key}: {value:.2f}%")
-                else:
-                    lines.append(f"{key}: {_format_number(value)}")
-
-    # Se nenhuma metrica especifica foi formatada, usa fallback generico
-    if not lines:
-        return _format_generic_metrics(metrics)
-
-    return "\n".join(lines)
-
-
-def _format_distribution_metrics(metrics: Dict[str, Any]) -> str:
-    """Formata metricas de distribuicao (pie) com formulas explicitas."""
-    lines = []
-
-    total = metrics.get("total", 0)
-    top_n = metrics.get("top_n", 0)
-    sum_top_n = metrics.get("sum_top_n", 0)
-    concentracao_top_n = metrics.get("concentracao_top_n_pct", 0)
-
-    if top_n > 0 and total > 0:
-        lines.append(
-            f"Top {top_n} = {_format_number(sum_top_n)} / Total {_format_number(total)} "
-            f"→ {concentracao_top_n:.2f}%"
-        )
-
-    hhi = metrics.get("hhi")
-    if hhi is not None:
-        lines.append(f"Indice HHI (concentracao): {hhi:.2f}")
-
-    diversidade = metrics.get("diversidade_pct")
-    if diversidade is not None:
-        lines.append(f"Indice de diversidade: {diversidade:.2f}%")
-
-    # Adiciona outras metricas
-    for key, value in metrics.items():
-        if key not in [
-            "total",
-            "top_n",
-            "sum_top_n",
-            "concentracao_top_n_pct",
-            "hhi",
-            "diversidade_pct",
-        ]:
-            if (
-                isinstance(value, (int, float))
-                and not key.endswith("_col")
-                and not key.endswith("_label")
-            ):
-                if key.endswith("_pct") or "percentual" in key.lower():
-                    lines.append(f"{key}: {value:.2f}%")
-                else:
-                    lines.append(f"{key}: {_format_number(value)}")
-
-    # Se nenhuma metrica especifica foi formatada, usa fallback generico
-    if not lines:
-        return _format_generic_metrics(metrics)
-
-    return "\n".join(lines)
-
-
-def _format_generic_metrics(metrics: Dict[str, Any]) -> str:
-    """Formata metricas genericas quando chart_type nao e reconhecido."""
-    lines = []
-
-    for key, value in metrics.items():
-        if isinstance(value, dict) or key.endswith("_col") or key.endswith("_label"):
-            continue
-
-        if isinstance(value, (int, float)):
-            if key.endswith("_pct") or "percentual" in key.lower():
-                lines.append(f"{key}: {value:.2f}%")
-            else:
-                lines.append(f"{key}: {_format_number(value)}")
-        else:
-            lines.append(f"{key}: {value}")
-
-    return "\n".join(lines)
-
-
-def _format_metrics_for_prompt(
-    numeric_summary: Dict[str, Any], chart_type: str = ""
-) -> str:
+def _format_simplified_metrics(numeric_summary: Dict[str, Any]) -> str:
     """
-    Formata metricas numericas para inclusao no prompt COM FORMULAS EXPLICITAS.
+    Format metrics for the prompt, keeping only essential context.
+
+    FASE 2: Simplifies metric formatting by excluding academic/statistical
+    metrics (HHI, diversity indices, balance scores, etc.) and keeping
+    only actionable values: totals, top N, min/max, variations.
 
     Args:
-        numeric_summary: Dicionario com metricas calculadas
-        chart_type: Tipo de grafico para formatacao especifica
+        numeric_summary: Dict with calculated metrics
 
     Returns:
-        String formatada com metricas e formulas para o prompt
+        Formatted string with simplified metrics
     """
-    # Detecta chart_type baseado em keys presentes se nao fornecido
-    if not chart_type:
-        if "sum_top_n" in numeric_summary and "lider_valor" in numeric_summary:
-            chart_type = "bar_horizontal"
-        elif (
-            "valor_inicial" in numeric_summary
-            and "variacao_percentual" in numeric_summary
-        ):
-            chart_type = "line"
-        elif (
-            "max_valor" in numeric_summary
-            and "min_valor" in numeric_summary
-            and "amplitude" in numeric_summary
-        ):
-            chart_type = "bar_vertical"
-        elif "hhi" in numeric_summary or "diversidade_pct" in numeric_summary:
-            chart_type = "pie"
+    if not numeric_summary:
+        return ""
 
-    # Aplica formatador especifico
-    if chart_type == "bar_horizontal":
-        return _format_ranking_metrics(numeric_summary)
-    elif chart_type in ["line", "line_composed"]:
-        return _format_temporal_metrics(numeric_summary)
-    elif chart_type in [
-        "bar_vertical",
-        "bar_vertical_composed",
-        "bar_vertical_stacked",
-    ]:
-        return _format_comparison_metrics(numeric_summary)
-    elif chart_type == "pie":
-        return _format_distribution_metrics(numeric_summary)
-    elif chart_type == "histogram":
-        return _format_distribution_metrics(numeric_summary)  # Usa distribuicao
-    else:
-        return _format_generic_metrics(numeric_summary)
+    lines = []
+
+    # Total geral
+    total = numeric_summary.get("total")
+    if total is not None and isinstance(total, (int, float)):
+        lines.append(f"Total geral: {_format_number(total)}")
+
+    # Top N with values
+    top_n = numeric_summary.get("top_n")
+    sum_top_n = numeric_summary.get("sum_top_n")
+    concentracao = numeric_summary.get("concentracao_top_n_pct")
+    if top_n and sum_top_n:
+        line = f"Top {top_n}: {_format_number(sum_top_n)}"
+        if concentracao:
+            line += f" ({concentracao:.1f}% do total)"
+        lines.append(line)
+
+    # Leader
+    lider_label = numeric_summary.get("lider_label")
+    lider_valor = numeric_summary.get("lider_valor")
+    if lider_label and lider_valor:
+        lines.append(f"Líder: {lider_label} = {_format_number(lider_valor)}")
+
+    # Gap between 1st and 2nd
+    gap_absoluto = numeric_summary.get("gap_absoluto")
+    gap_percentual = numeric_summary.get("gap_percentual")
+    if gap_absoluto and gap_percentual:
+        lines.append(
+            f"Gap líder-segundo: {_format_number(gap_absoluto)} ({gap_percentual:.1f}%)"
+        )
+
+    # Min/Max with labels
+    max_valor = numeric_summary.get("max_valor")
+    max_label = numeric_summary.get("max_label")
+    min_valor = numeric_summary.get("min_valor")
+    min_label = numeric_summary.get("min_label")
+    if max_valor is not None and min_valor is not None:
+        max_str = f"Max: {_format_number(max_valor)}"
+        if max_label:
+            max_str = f"Max ({max_label}): {_format_number(max_valor)}"
+        min_str = f"Min: {_format_number(min_valor)}"
+        if min_label:
+            min_str = f"Min ({min_label}): {_format_number(min_valor)}"
+        lines.append(f"{max_str} | {min_str}")
+
+    # Total variation (when temporal)
+    variacao_percentual = numeric_summary.get("variacao_percentual")
+    valor_inicial = numeric_summary.get("valor_inicial")
+    valor_final = numeric_summary.get("valor_final")
+    if variacao_percentual is not None and valor_inicial and valor_final:
+        lines.append(
+            f"Variação: {_format_number(valor_inicial)} → "
+            f"{_format_number(valor_final)} ({variacao_percentual:+.1f}%)"
+        )
+
+    # Trend if detected
+    tendencia = numeric_summary.get("tendencia")
+    if tendencia:
+        lines.append(f"Tendência: {tendencia}")
+
+    # Include remaining numeric metrics that are NOT excluded
+    seen_keys = {
+        "total",
+        "top_n",
+        "sum_top_n",
+        "concentracao_top_n_pct",
+        "lider_label",
+        "lider_valor",
+        "peso_lider_total_pct",
+        "segundo_valor",
+        "segundo_label",
+        "gap_absoluto",
+        "gap_percentual",
+        "max_valor",
+        "max_label",
+        "min_valor",
+        "min_label",
+        "variacao_percentual",
+        "valor_inicial",
+        "valor_final",
+        "variacao_absoluta",
+        "tendencia",
+        "metadata",
+        "modules_used",
+        "top3_sum",
+        "concentracao_top3_pct",
+        "total_items",
+        "tail_sum",
+        "tail_pct",
+    }
+
+    for key, value in numeric_summary.items():
+        if key in seen_keys:
+            continue
+        if key.startswith("_") or key.endswith("_col") or key.endswith("_label"):
+            continue
+        if isinstance(value, (dict, list)):
+            continue
+        # Exclude academic/noise metrics
+        key_lower = key.lower()
+        if any(excl in key_lower for excl in _EXCLUDED_METRIC_KEYS):
+            continue
+        if isinstance(value, (int, float)):
+            if key.endswith("_pct") or "percentual" in key_lower:
+                lines.append(f"{key}: {value:.1f}%")
+            else:
+                lines.append(f"{key}: {_format_number(value)}")
+
+    if not lines:
+        return ""
+
+    return "\n".join(lines)
+
+
+# ============================================================================
+# Main prompt builder (FASE 2: intention-driven)
+# ============================================================================
 
 
 def build_prompt(
-    numeric_summary: Dict[str, Any], chart_type: str, filters: Dict[str, Any] = None
+    numeric_summary: Dict[str, Any],
+    chart_type: str,
+    filters: Dict[str, Any] = None,
+    user_query: str = "",
+    data_table: str = "",
+    intent_context: str = "",
+    enriched_intent: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Constrói prompt específico por chart_type.
+    Build intention-driven prompt for the LLM.
+
+    FASE 2: Constructs a dynamic prompt centered on the user's question,
+    with real data, contextual filters, and simplified metrics as auxiliary
+    context. No chart-type templates or rigid structure imposed.
 
     Args:
-        numeric_summary: Dicionário com metadados calculados pelo calculator
-        chart_type: Tipo de gráfico (bar_horizontal, line, etc.)
-        filters: Filtros aplicados à análise (opcional)
+        numeric_summary: Calculated metrics (auxiliary context only)
+        chart_type: Chart type (used only for logging, not for template selection)
+        filters: Active filters (optional)
+        user_query: Original user question (primary directive)
+        data_table: Real data as markdown table
+        intent_context: Semantic context from enriched_intent
+        enriched_intent: Full enriched intent dict (for guideline selection)
 
     Returns:
-        String com prompt formatado para a LLM
-
-    Raises:
-        ValueError: Se chart_type não for reconhecido
+        Formatted prompt string for the LLM
     """
-    # Get template for chart type (fallback to bar_horizontal)
-    template = CHART_TYPE_TEMPLATES.get(
-        chart_type, CHART_TYPE_TEMPLATES["bar_horizontal"]
-    )
+    sections = []
 
-    # Format metrics with explicit formulas (pass chart_type)
-    dados_formatados = _format_metrics_for_prompt(numeric_summary, chart_type)
+    # Primary: User question
+    if user_query:
+        sections.append(
+            f'PERGUNTA DO USUÁRIO:\n"{user_query}"\n\n'
+            f"Sua resposta DEVE responder diretamente a esta pergunta."
+        )
 
-    # Format filters section if present
-    filters_section = _format_filters_for_prompt(filters) if filters else ""
+    # Filters with semantic context
+    if filters:
+        filters_text = _format_filters_for_prompt(filters)
+        if filters_text:
+            sections.append(
+                f"FILTROS ATIVOS:\n{filters_text}\n\n"
+                f"Mencione os filtros naturalmente na resposta quando relevante, "
+                f"usando nomes legíveis (ex: 'Santa Catarina' em vez de 'SC')."
+            )
 
-    # Build full prompt with filters context
-    prompt = template.format(dados=dados_formatados)
+    # Real data as markdown table
+    if data_table:
+        sections.append(
+            f"DADOS DISPONÍVEIS:\n{data_table}\n\n"
+            f"Use estes dados para fundamentar sua resposta com valores específicos "
+            f"(nomes, números, percentuais). Cite os dados reais."
+        )
 
-    if filters_section:
-        prompt = f"""{prompt}
+    # Enriched intent context
+    if intent_context:
+        sections.append(f"CONTEXTO DA ANÁLISE:\n{intent_context}")
 
-═══════════════════════════════════════════════════════════════════════════════
-FILTROS APLICADOS (OBRIGATÓRIO MENCIONAR EM BOLD NA INTRODUCTION)
-═══════════════════════════════════════════════════════════════════════════════
+    # Simplified metrics as auxiliary context (not as a template to fill)
+    metrics_text = _format_simplified_metrics(numeric_summary)
+    if metrics_text:
+        sections.append(f"MÉTRICAS AUXILIARES (contexto adicional):\n{metrics_text}")
 
-{filters_section}
+    return "\n\n".join(sections)
 
-IMPORTANTE: A introduction DEVE mencionar TODOS estes filtros em **negrito**.
-Exemplo: "Esta análise examina ... considerando {filters_section}."
-"""
 
-    return prompt
+# ============================================================================
+# Filter formatting (preserved from FASE 1)
+# ============================================================================
 
 
 def _format_filters_for_prompt(filters: Dict[str, Any]) -> str:
     """
-    Formata filtros para inclusão no prompt de forma legível.
+    Format filters for prompt inclusion with semantic context.
+
+    Produces human-readable filter descriptions that allow the LLM
+    to contextualize them naturally in the response narrative.
 
     Args:
-        filters: Dicionário de filtros aplicados
+        filters: Dict of applied filters
 
     Returns:
-        String formatada com filtros
+        Formatted string with readable filters
     """
     if not filters:
-        return "Nenhum filtro aplicado"
+        return ""
 
     descriptions = []
     for key, value in filters.items():
+        readable_key = key.replace("_", " ")
+
         if isinstance(value, list):
             if len(value) == 1:
-                descriptions.append(f"**{key}: {value[0]}**")
+                descriptions.append(f"{readable_key}: {value[0]}")
             else:
-                descriptions.append(f"**{key}: {', '.join(map(str, value))}**")
+                descriptions.append(f"{readable_key}: {', '.join(map(str, value))}")
         elif isinstance(value, dict):
             if "between" in value:
                 descriptions.append(
-                    f"**{key}: entre {value['between'][0]} e {value['between'][1]}**"
+                    f"{readable_key}: entre {value['between'][0]} e {value['between'][1]}"
                 )
             else:
-                descriptions.append(f"**{key}: {value}**")
+                descriptions.append(f"{readable_key}: {value}")
         else:
-            descriptions.append(f"**{key}: {value}**")
+            descriptions.append(f"{readable_key}: {value}")
 
-    return ", ".join(descriptions)
+    return " | ".join(descriptions)

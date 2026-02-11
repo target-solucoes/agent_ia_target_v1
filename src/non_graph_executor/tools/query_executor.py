@@ -79,6 +79,110 @@ class QueryExecutor:
         logger.info(f"QueryExecutor initialized for: {data_source}")
 
     # =========================================================================
+    # DYNAMIC QUERY EXECUTION (Phase 3)
+    # =========================================================================
+
+    def execute_dynamic_query(
+        self,
+        sql: str,
+        timeout: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """
+        Executa query SQL dinâmica gerada pelo DynamicQueryBuilder.
+
+        Este método é o ponto de entrada para execução de queries
+        construídas dinamicamente a partir do QueryIntent, suportando
+        GROUP BY, ORDER BY, LIMIT e funções temporais.
+
+        Diferente dos métodos especializados (compute_simple_aggregation,
+        lookup_record, etc.), este método aceita SQL arbitrário gerado
+        pelo DynamicQueryBuilder — que já valida colunas e expressões.
+
+        Args:
+            sql: Query SQL completa gerada pelo DynamicQueryBuilder
+            timeout: Timeout em segundos para a execução (default: 30)
+
+        Returns:
+            Lista de dicts, cada um representando uma linha do resultado.
+            Para agregações simples sem GROUP BY, retorna lista com 1 dict.
+            Para agregações com GROUP BY, retorna lista de dicts (um por grupo).
+
+        Raises:
+            Exception: Se ocorrer erro na execução da query DuckDB
+
+        Example:
+            >>> sql = 'SELECT MONTH("Data") as Mes, SUM("Valor_Vendido") as total '
+            ...       "FROM 'data/dataset.parquet' GROUP BY MONTH(\"Data\") "
+            ...       'ORDER BY total DESC LIMIT 1'
+            >>> results = executor.execute_dynamic_query(sql)
+            >>> print(results)
+            [{'Mes': 3, 'total': 5200000.0}]
+        """
+        logger.info(f"[QueryExecutor] Executing dynamic query:\n{sql}")
+
+        try:
+            with duckdb.connect() as conn:
+                result = conn.execute(sql).fetchall()
+                columns = [desc[0] for desc in conn.description]
+
+            # Converter para lista de dicts
+            rows = []
+            for row_tuple in result:
+                row_dict = {}
+                for col_name, value in zip(columns, row_tuple):
+                    # Converter tipos DuckDB para Python nativos
+                    row_dict[col_name] = self._convert_duckdb_value(value)
+                rows.append(row_dict)
+
+            logger.info(
+                f"[QueryExecutor] Dynamic query returned {len(rows)} rows, "
+                f"columns: {columns}"
+            )
+            return rows
+
+        except Exception as e:
+            logger.error(
+                f"[QueryExecutor] Error executing dynamic query: {e}\nSQL: {sql}",
+                exc_info=True,
+            )
+            raise
+
+    @staticmethod
+    def _convert_duckdb_value(value: Any) -> Any:
+        """
+        Converte valores DuckDB para tipos Python nativos.
+
+        DuckDB pode retornar tipos como Decimal, datetime, date, etc.
+        que precisam ser convertidos para tipos JSON-serializáveis.
+
+        Args:
+            value: Valor retornado pelo DuckDB
+
+        Returns:
+            Valor convertido para tipo Python nativo
+        """
+        if value is None:
+            return None
+
+        # Importações tardias para não impactar startup
+        import decimal
+        import datetime
+
+        if isinstance(value, decimal.Decimal):
+            return float(value)
+        if isinstance(value, datetime.datetime):
+            return value.isoformat()
+        if isinstance(value, datetime.date):
+            return value.isoformat()
+        if isinstance(value, datetime.timedelta):
+            return str(value)
+        if isinstance(value, (int, float, str, bool)):
+            return value
+
+        # Fallback: converter para string
+        return str(value)
+
+    # =========================================================================
     # METADATA QUERIES
     # =========================================================================
 
@@ -295,7 +399,15 @@ class QueryExecutor:
                             )
 
                     # Se não é categórica nem numérica conhecida, emitir warning mas continuar
-                    if column not in numeric_cols and column not in categorical_cols:
+                    # Colunas virtuais (Ano, Mes) são aceitáveis para MIN/MAX — não emitir warning
+                    is_virtual = hasattr(
+                        self.alias_mapper, "is_virtual_column"
+                    ) and self.alias_mapper.is_virtual_column(column)
+                    if (
+                        column not in numeric_cols
+                        and column not in categorical_cols
+                        and not is_virtual
+                    ):
                         logger.warning(
                             f"Column '{column}' type is unknown. "
                             f"Attempting {aggregation.upper()} aggregation anyway."
@@ -314,8 +426,21 @@ class QueryExecutor:
             if filters:
                 where_clause = f"WHERE {self._build_where_clause(filters)}"
 
-            # Escapar nome da coluna
-            col_escaped = f'"{column}"'
+            # Resolver coluna virtual (Ano -> YEAR("Data"), Mes -> MONTH("Data"), etc.)
+            # Colunas virtuais não existem fisicamente no dataset e requerem expressões SQL.
+            is_virtual = (
+                self.alias_mapper
+                and hasattr(self.alias_mapper, "is_virtual_column")
+                and self.alias_mapper.is_virtual_column(column)
+            )
+
+            if is_virtual:
+                col_escaped = self.alias_mapper.get_virtual_expression(column)
+                logger.debug(
+                    f"Resolved virtual column '{column}' to expression: {col_escaped}"
+                )
+            else:
+                col_escaped = f'"{column}"'
 
             # Para COUNT com distinct=True, usar COUNT(DISTINCT column)
             if aggregation.lower() == "count" and distinct:
@@ -687,6 +812,47 @@ class QueryExecutor:
     # HELPER METHODS
     # =========================================================================
 
+    def _is_temporal_date_range(self, col: str, values: list) -> bool:
+        """
+        Detecta se uma lista de valores representa um intervalo temporal (BETWEEN).
+
+        O filter_classifier produz filtros de data como listas de 2 elementos:
+        {"Data": ["2016-01-01", "2016-12-31"]} que representam um intervalo
+        BETWEEN, NÃO um IN com 2 valores específicos.
+
+        Critérios de detecção:
+        1. A lista tem exatamente 2 elementos
+        2. A coluna é temporal ("Data" ou registrada como temporal no alias_mapper)
+        3. Ambos os valores parecem ser datas (formato YYYY-MM-DD)
+
+        Args:
+            col: Nome da coluna do filtro
+            values: Lista de valores do filtro
+
+        Returns:
+            True se os valores representam um intervalo temporal
+        """
+        if len(values) != 2:
+            return False
+
+        # Verificar se a coluna é temporal
+        is_temporal = col in ("Data", "data")
+        if not is_temporal and self.alias_mapper:
+            temporal_cols = getattr(self.alias_mapper, "column_types", {}).get(
+                "temporal", []
+            )
+            if col in temporal_cols:
+                is_temporal = True
+
+        if not is_temporal:
+            return False
+
+        # Verificar se ambos os valores parecem ser datas (YYYY-MM-DD)
+        import re
+
+        date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}")
+        return all(isinstance(v, str) and date_pattern.match(v) for v in values)
+
     def _build_where_clause(self, filters: Dict[str, Any]) -> str:
         """
         Constrói WHERE clause a partir de filtros.
@@ -719,44 +885,78 @@ class QueryExecutor:
         conditions = []
 
         for col, value in filters.items():
-            # Special handling: "Ano" filter transforms to YEAR(Data) if Ano column doesn't exist
-            # This allows tests and queries to use "Ano" semantically even if column is "Data"
+            # Tratamento de colunas virtuais em filtros:
+            # Colunas virtuais (Ano, Mes, Nome_Mes) não existem fisicamente no dataset.
+            # Transformamos para suas expressões DuckDB equivalentes.
             if col == "Ano" or col == "ano":
                 col_escaped = 'YEAR("Data")'
                 logger.debug(
                     "Transforming filter 'Ano' to YEAR(Data) for year-based filtering"
                 )
+            elif col == "Mes" or col == "mes":
+                col_escaped = 'MONTH("Data")'
+                logger.debug(
+                    "Transforming filter 'Mes' to MONTH(Data) for month-based filtering"
+                )
+            elif col == "Nome_Mes" or col == "nome_mes":
+                col_escaped = 'MONTHNAME("Data")'
+                logger.debug(
+                    "Transforming filter 'Nome_Mes' to MONTHNAME(Data) for month name filtering"
+                )
+            elif (
+                self.alias_mapper
+                and hasattr(self.alias_mapper, "is_virtual_column")
+                and self.alias_mapper.is_virtual_column(col)
+            ):
+                col_escaped = self.alias_mapper.get_virtual_expression(col)
+                logger.debug(
+                    f"Transforming virtual column filter '{col}' to expression: {col_escaped}"
+                )
             else:
                 # Escapar nome da coluna
                 col_escaped = f'"{col}"'
 
-            # Case 1: Lista de valores → IN clause
+            # Case 1: Lista de valores
             if isinstance(value, list):
-                # Check if column is categorical for case-insensitive comparison
-                is_categorical = (
-                    self.alias_mapper and self.alias_mapper.is_categorical_column(col)
-                )
-
-                # Escapar cada valor se string
-                escaped_values = []
-                for v in value:
-                    if isinstance(v, str):
-                        v_escaped = v.replace("'", "''")
-                        # For categorical columns, convert to UPPER for case-insensitive match
-                        if is_categorical:
-                            escaped_values.append(f"UPPER('{v_escaped}')")
-                        else:
-                            escaped_values.append(f"'{v_escaped}'")
-                    else:
-                        escaped_values.append(str(v))
-
-                values_str = ", ".join(escaped_values)
-
-                # For categorical columns, use UPPER on column as well
-                if is_categorical:
-                    conditions.append(f"UPPER({col_escaped}) IN ({values_str})")
+                # Sub-case 1a: Intervalo temporal (2 datas) → BETWEEN
+                if self._is_temporal_date_range(col, value):
+                    start_escaped = value[0].replace("'", "''")
+                    end_escaped = value[1].replace("'", "''")
+                    conditions.append(
+                        f"{col_escaped} BETWEEN '{start_escaped}' AND '{end_escaped}'"
+                    )
+                    logger.debug(
+                        f"Temporal date range detected for '{col}': "
+                        f"BETWEEN {value[0]} AND {value[1]}"
+                    )
                 else:
-                    conditions.append(f"{col_escaped} IN ({values_str})")
+                    # Sub-case 1b: Lista regular → IN clause
+                    # Check if column is categorical for case-insensitive comparison
+                    is_categorical = (
+                        self.alias_mapper
+                        and self.alias_mapper.is_categorical_column(col)
+                    )
+
+                    # Escapar cada valor se string
+                    escaped_values = []
+                    for v in value:
+                        if isinstance(v, str):
+                            v_escaped = v.replace("'", "''")
+                            # For categorical columns, convert to UPPER for case-insensitive match
+                            if is_categorical:
+                                escaped_values.append(f"UPPER('{v_escaped}')")
+                            else:
+                                escaped_values.append(f"'{v_escaped}'")
+                        else:
+                            escaped_values.append(str(v))
+
+                    values_str = ", ".join(escaped_values)
+
+                    # For categorical columns, use UPPER on column as well
+                    if is_categorical:
+                        conditions.append(f"UPPER({col_escaped}) IN ({values_str})")
+                    else:
+                        conditions.append(f"{col_escaped} IN ({values_str})")
 
             # Case 2: Dict com operador ou between
             elif isinstance(value, dict):

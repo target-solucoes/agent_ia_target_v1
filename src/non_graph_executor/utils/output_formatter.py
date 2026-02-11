@@ -247,9 +247,16 @@ class OutputFormatter:
         """
         Cria prompt para summarizar resultado de agregação.
 
+        Suporta tanto resultados escalares simples (1 valor) quanto
+        resultados multi-dimensionais (com GROUP BY, rankings, etc.).
+
+        Para dados multi-dimensionais, inclui TODOS os dados retornados
+        no prompt para que o LLM possa gerar uma resposta completa
+        identificando dimensões (mês, estado, etc.) e valores.
+
         Args:
             query: Query original
-            data: Resultado da agregação
+            data: Resultado da agregação (pode ser multi-dimensional)
             filters: Filtros aplicados
 
         Returns:
@@ -259,7 +266,45 @@ class OutputFormatter:
             f"\nFiltros aplicados: {filters}" if filters else "\nSem filtros aplicados"
         )
 
-        return f"""Resuma o resultado da agregação de forma concisa:
+        # Verificar se resultado é multi-dimensional (mais de 1 coluna ou mais de 1 linha)
+        is_multi_dimensional = False
+        if data:
+            first_row = data[0]
+            # Multi-dimensional: mais de 1 chave no dict ou mais de 1 linha
+            if len(first_row) > 1 or len(data) > 1:
+                is_multi_dimensional = True
+
+        if is_multi_dimensional:
+            # Formatar dados completos de forma legível
+            # Limitar a 20 linhas para evitar prompts muito longos
+            display_data = data[:20]
+            data_text = ""
+            for i, row in enumerate(display_data, 1):
+                row_items = [f"{k}: {v}" for k, v in row.items()]
+                data_text += f"  {i}. {', '.join(row_items)}\n"
+
+            if len(data) > 20:
+                data_text += f"  ... e mais {len(data) - 20} resultados\n"
+
+            return f"""Resuma o resultado da análise de forma concisa e completa:
+
+Query: "{query}"
+Dados retornados ({len(data)} resultado(s)):
+{data_text}
+{filters_text}
+
+INSTRUÇÕES IMPORTANTES:
+- Responda DIRETAMENTE à pergunta feita pelo usuário.
+- Se os dados contêm dimensões (mês, estado, etc.), SEMPRE identifique-as pelo nome na resposta.
+- Para valores monetários, use formato R$ com separadores de milhar.
+- Para meses numéricos, converta para nomes (1=janeiro, 2=fevereiro, 3=março, 4=abril, 5=maio, 6=junho, 7=julho, 8=agosto, 9=setembro, 10=outubro, 11=novembro, 12=dezembro).
+- Se houver ranking, mencione a posição e o valor.
+- Responda em 1-3 frases, de forma clara e objetiva.
+- NÃO adicione sugestões ou contexto extra além do solicitado."""
+
+        else:
+            # Resultado escalar simples (comportamento original)
+            return f"""Resuma o resultado da agregação de forma concisa:
 
 Query: "{query}"
 Resultado: {data[0] if data else "Nenhum resultado"}

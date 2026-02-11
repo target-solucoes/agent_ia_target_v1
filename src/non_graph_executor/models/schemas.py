@@ -152,6 +152,15 @@ class QueryTypeClassification(BaseModel):
     requires_llm: bool
     parameters: Dict[str, Any] = Field(default_factory=dict)
 
+    # QueryIntent from IntentAnalyzer (Phase 2) — carries full semantic analysis
+    # for downstream components (DynamicQueryBuilder in Phase 3).
+    # Typed as Any to avoid circular imports; at runtime this will be a QueryIntent instance.
+    intent: Optional[Any] = Field(
+        default=None,
+        description="Full semantic intent from IntentAnalyzer (when available)",
+        exclude=True,  # Excluded from JSON serialization
+    )
+
     model_config = ConfigDict(
         json_schema_extra={
             "example": {

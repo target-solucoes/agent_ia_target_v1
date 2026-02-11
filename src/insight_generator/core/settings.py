@@ -24,8 +24,20 @@ GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
 
 # CRITICAL: OPENAI_API_KEY variable is used throughout codebase for backward compatibility
 # but should PRIORITIZE GEMINI_API_KEY first, then fallback to OPENAI_API_KEY
-OPENAI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL: str = os.getenv("GEMINI_MODEL") or os.getenv("OPENAI_MODEL", "gemini-2.5-flash-lite")
+OPENAI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY") or os.getenv(
+    "OPENAI_API_KEY"
+)
+OPENAI_MODEL: str = os.getenv("GEMINI_MODEL") or os.getenv(
+    "OPENAI_MODEL", "gemini-2.5-flash"
+)
+
+# ========== FASE 3: Model Selection Configuration ==========
+# Default model for insight generation (upgraded from flash-lite)
+INSIGHT_MODEL_DEFAULT: str = os.getenv("INSIGHT_MODEL_DEFAULT", "gemini-2.5-flash")
+# Lite model for simple queries (rankings, single metrics)
+INSIGHT_MODEL_LITE: str = os.getenv("INSIGHT_MODEL_LITE", "gemini-2.5-flash-lite")
+# Temperature: balanced between creativity and consistency
+INSIGHT_TEMPERATURE_DEFAULT: float = float(os.getenv("INSIGHT_TEMPERATURE", "0.4"))
 
 # Legacy settings (kept for backward compatibility)
 # REASONING_EFFORT was used for GPT-5 models, not applicable to Gemini but kept for compatibility
@@ -99,7 +111,9 @@ def validate_settings() -> bool:
     # Validate reasoning effort (legacy GPT-5 parameter - not used with Gemini)
     # NOTE: This validation is kept for backward compatibility but REASONING_EFFORT
     # is not used with Gemini models (only with legacy GPT-5 configurations)
-    if OPENAI_API_KEY and not GEMINI_API_KEY:  # Only validate if using pure OpenAI (legacy)
+    if (
+        OPENAI_API_KEY and not GEMINI_API_KEY
+    ):  # Only validate if using pure OpenAI (legacy)
         valid_efforts = ["minimal", "low", "medium", "high"]
         if REASONING_EFFORT not in valid_efforts:
             raise ValueError(

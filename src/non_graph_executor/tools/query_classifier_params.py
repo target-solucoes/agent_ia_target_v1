@@ -255,6 +255,31 @@ class ParameterExtractor:
         # 9. Quantidade
         elif "quantidade" in query_lower:
             params["aggregation"] = "count"
+        # 10. Último/Mais recente → MAX (ex: "último ano", "última venda", "mais recente")
+        elif any(
+            kw in query_lower
+            for kw in [
+                "ultimo",
+                "última",
+                "ultimo",
+                "ultima",
+                "mais recente",
+                "mais novo",
+                "mais nova",
+            ]
+        ):
+            params["aggregation"] = "max"
+        # 11. Primeiro/Mais antigo → MIN (ex: "primeiro ano", "primeira venda", "mais antigo")
+        elif any(
+            kw in query_lower
+            for kw in [
+                "primeiro",
+                "primeira",
+                "mais antigo",
+                "mais antiga",
+            ]
+        ):
+            params["aggregation"] = "min"
         else:
             # Default to sum
             params["aggregation"] = "sum"
@@ -422,6 +447,10 @@ Retorne APENAS um JSON válido no formato:
         prioriza colunas NUMÉRICAS sobre colunas categóricas, pois a agregação
         deve ser aplicada a métricas numéricas, não a dimensões categóricas.
 
+        Para queries com intenção temporal (último ano, em que mês, quando, etc.),
+        prioriza colunas TEMPORAIS ou VIRTUAIS TEMPORAIS (Ano, Mes, Data) sobre
+        colunas numéricas, pois o usuário quer saber QUANDO, não QUANTO.
+
         Args:
             query: Query original
             alias_mapper: AliasMapper para resolução
@@ -430,6 +459,40 @@ Retorne APENAS um JSON válido no formato:
             Nome real da coluna ou None
         """
         query_lower = query.lower()
+
+        # Detectar se a query tem intenção temporal
+        # Estas keywords indicam que o usuário quer saber QUANDO algo ocorreu,
+        # não QUANTO foi o valor — portanto a coluna alvo deve ser temporal.
+        temporal_intent_keywords = [
+            "ultimo ano",
+            "última ano",
+            "ultimo ano",
+            "ultima ano",
+            "primeiro ano",
+            "primeira ano",
+            "em que ano",
+            "qual ano",
+            "qual o ano",
+            "ultimo mes",
+            "última mes",
+            "ultimo mês",
+            "ultima mês",
+            "primeiro mes",
+            "primeira mes",
+            "primeiro mês",
+            "em que mes",
+            "em que mês",
+            "qual mes",
+            "qual mês",
+            "qual o mes",
+            "qual o mês",
+            "quando foi",
+            "quando ocorreu",
+            "em que data",
+            "em que periodo",
+            "em que período",
+        ]
+        is_temporal_intent = any(kw in query_lower for kw in temporal_intent_keywords)
 
         # Detectar se é uma query de agregação numérica
         is_numeric_aggregation = any(
@@ -489,6 +552,34 @@ Retorne APENAS um JSON válido no formato:
 
         # Se encontrou colunas, aplicar lógica de priorização
         if resolved_columns:
+            # Para queries com intenção temporal, PRIORIZAR colunas temporais/virtuais
+            # Isso garante que "qual o último ano com vendas?" resolva para "Ano"
+            # (coluna virtual → YEAR("Data")) em vez de "Valor_Vendido"
+            if is_temporal_intent:
+                try:
+                    temporal_cols = alias_mapper.column_types.get("temporal", [])
+                    # Verificar colunas virtuais temporais (Ano, Mes, Nome_Mes)
+                    has_virtual = hasattr(alias_mapper, "is_virtual_column")
+
+                    for term, col in resolved_columns:
+                        is_temporal = col in temporal_cols
+                        is_virtual_temporal = (
+                            has_virtual and alias_mapper.is_virtual_column(col)
+                        )
+                        if is_temporal or is_virtual_temporal:
+                            logger.debug(
+                                f"Resolved column (temporal priority): '{term}' -> '{col}' "
+                                f"(temporal={is_temporal}, virtual={is_virtual_temporal})"
+                            )
+                            return col
+
+                    logger.debug(
+                        f"Temporal intent detected but no temporal column found in resolved: "
+                        f"{[c[1] for c in resolved_columns]}"
+                    )
+                except (AttributeError, KeyError):
+                    pass
+
             # Para agregações numéricas, PRIORIZAR colunas numéricas
             if is_numeric_aggregation:
                 try:

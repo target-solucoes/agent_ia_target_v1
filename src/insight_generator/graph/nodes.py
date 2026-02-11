@@ -24,12 +24,9 @@ from ..core.intent_enricher import (
 )
 from ..calculators import get_calculator
 from ..calculators.metric_composer import MetricComposer
-from ..formatters.prompt_builder import build_prompt, SYSTEM_PROMPT
+from ..formatters.prompt_builder import build_prompt, build_system_prompt
 from ..formatters.markdown_formatter import ExecutiveMarkdownFormatter
-from ..models.insight_schemas import load_insight_llm
-from ..utils.transparency_validator import validate_insight_dict_transparency
-from ..utils.alignment_validator import validate_alignment
-from ..utils.alignment_corrector import apply_corrections
+from ..models.insight_schemas import load_insight_llm, select_insight_model
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +176,13 @@ def parse_input_node(state: InsightState) -> InsightState:
             )
             state["enriched_intent"] = None
 
-        logger.info("[parse_input_node] Input parsing complete")
+        # ========== FASE 3: INLINE METRIC CALCULATION ==========
+        # Previously a separate workflow node (calculate_metrics_node).
+        # Now inlined into parse_input to reduce pipeline from 7 to 4 nodes.
+        logger.info("[parse_input_node] Starting inline metric calculation (FASE 3)")
+        state = _calculate_metrics(state)
+
+        logger.info("[parse_input_node] Input parsing and metrics complete")
         return state
 
     except Exception as e:
@@ -188,6 +191,16 @@ def parse_input_node(state: InsightState) -> InsightState:
             state["errors"] = []
         state["errors"].append(f"parse_input_node: {str(e)}")
         return state
+
+
+def _calculate_metrics(state: InsightState) -> InsightState:
+    """
+    Calculate metrics (inlined from former calculate_metrics_node).
+
+    FASE 3: This was a separate workflow node, now called directly
+    from parse_input_node.
+    """
+    return calculate_metrics_node(state)
 
 
 def calculate_metrics_node(state: InsightState) -> InsightState:
@@ -558,13 +571,114 @@ def _generate_cache_key(
     return hashlib.md5(cache_str.encode()).hexdigest()
 
 
+def _format_dataframe_as_markdown(df: pd.DataFrame, max_rows: int = 20) -> str:
+    """
+    Format a DataFrame as a markdown table for inclusion in the LLM prompt.
+
+    Limits output to max_rows to control token usage.
+    Formats numeric values for readability.
+
+    Args:
+        df: DataFrame to format
+        max_rows: Maximum number of rows to include
+
+    Returns:
+        Markdown table string
+    """
+    if df is None or df.empty:
+        return ""
+
+    display_df = df.head(max_rows).copy()
+    truncated = len(df) > max_rows
+
+    # Format numeric columns for readability
+    for col in display_df.columns:
+        if pd.api.types.is_numeric_dtype(display_df[col]):
+            display_df[col] = display_df[col].apply(
+                lambda x: (
+                    f"{x:,.0f}"
+                    if pd.notna(x) and abs(x) >= 1
+                    else (f"{x:.2f}" if pd.notna(x) else "-")
+                )
+            )
+
+    table = display_df.to_markdown(index=False)
+
+    if truncated:
+        table += f"\n\n(Mostrando {max_rows} de {len(df)} linhas)"
+
+    return table
+
+
+def _format_enriched_intent_for_prompt(enriched_intent: dict) -> str:
+    """
+    Format enriched_intent as a context block for the LLM prompt.
+
+    Translates structured intent metadata into natural language guidance.
+
+    Args:
+        enriched_intent: Dict with base_intent, polarity, temporal_focus, etc.
+
+    Returns:
+        Formatted intent context string
+    """
+    if not enriched_intent:
+        return ""
+
+    lines = []
+
+    narrative_angle = enriched_intent.get("narrative_angle", "")
+    if narrative_angle:
+        lines.append(f"- Angulo narrativo: {narrative_angle}")
+
+    polarity = enriched_intent.get("polarity", "neutral")
+    polarity_guidance = {
+        "positive": "focar em oportunidades, crescimento e destaques positivos",
+        "negative": "focar em riscos, quedas e pontos de atencao",
+        "neutral": "apresentar panorama geral de forma equilibrada",
+    }
+    lines.append(f"- Polaridade: {polarity} ({polarity_guidance.get(polarity, '')})")
+
+    temporal_focus = enriched_intent.get("temporal_focus", "")
+    if temporal_focus and temporal_focus != "single_period":
+        temporal_labels = {
+            "period_over_period": "comparacao entre periodos especificos",
+            "time_series": "evolucao ao longo do tempo (serie temporal)",
+            "seasonality": "analise de padroes sazonais",
+        }
+        lines.append(
+            f"- Foco temporal: {temporal_labels.get(temporal_focus, temporal_focus)}"
+        )
+
+    comparison_type = enriched_intent.get("comparison_type", "none")
+    if comparison_type and comparison_type != "none":
+        comparison_labels = {
+            "category_vs_category": "comparacao entre categorias",
+            "period_vs_period": "comparacao entre periodos",
+            "actual_vs_target": "comparacao real vs meta",
+        }
+        lines.append(
+            f"- Tipo de comparacao: {comparison_labels.get(comparison_type, comparison_type)}"
+        )
+
+    base_intent = enriched_intent.get("base_intent", "")
+    if base_intent:
+        lines.append(f"- Intencao base: {base_intent}")
+
+    return "\n".join(lines)
+
+
 def build_prompt_node(state: InsightState) -> InsightState:
     """
-    Node 3: Build LLM prompt from numeric summary.
+    Node 3: Build LLM prompt from numeric summary, user query, data, and intent.
 
     Constructs a chart-type-specific prompt using templates and
-    the calculated numeric metrics. Also includes applied filters
-    for context in the introduction.
+    the calculated numeric metrics. Injects user_query, real data (as markdown
+    table), enriched_intent context, and filter context into the prompt so the
+    LLM can generate responses that directly address the user's question.
+
+    FASE 1 Enhancement: Resolves P1 (user_query), P3 (query in prompt),
+    P5 (real data), P7 (enriched_intent) from diagnosis.
 
     Args:
         state: Current workflow state (must contain numeric_summary and chart_type)
@@ -586,17 +700,70 @@ def build_prompt_node(state: InsightState) -> InsightState:
 
         numeric_summary = state["numeric_summary"]
         chart_type = state["chart_type"]
-
-        # Extract filters from chart_spec for inclusion in introduction
-        filters = {}
         chart_spec = state.get("chart_spec", {})
+        analytics_result = state.get("analytics_result", {})
+
+        # --- 1.1: Extract user_query ---
+        user_query = chart_spec.get("user_query", "")
+        if not user_query:
+            user_query = analytics_result.get("metadata", {}).get("user_query", "")
+        if not user_query:
+            user_query = state.get("user_query", "")
+
+        if user_query:
+            logger.info(f"[build_prompt_node] user_query: {user_query}")
+        else:
+            logger.warning("[build_prompt_node] No user_query available")
+
+        # --- 1.2: Format real data as markdown table ---
+        data_table = ""
+        df = state.get("data")
+        if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+            data_table = _format_dataframe_as_markdown(df, max_rows=20)
+            logger.info(
+                f"[build_prompt_node] Formatted data table: {len(df)} rows, "
+                f"{len(df.columns)} columns"
+            )
+        else:
+            logger.warning("[build_prompt_node] No DataFrame available for data table")
+
+        # --- 1.3: Extract enriched_intent context ---
+        enriched_intent = state.get("enriched_intent")
+        intent_context = ""
+        if enriched_intent:
+            intent_context = _format_enriched_intent_for_prompt(enriched_intent)
+            logger.info(
+                f"[build_prompt_node] Enriched intent included: "
+                f"polarity={enriched_intent.get('polarity')}, "
+                f"narrative_angle={enriched_intent.get('narrative_angle', '')[:60]}"
+            )
+        else:
+            logger.warning("[build_prompt_node] No enriched_intent available")
+
+        # --- 1.4: Extract filters with semantic context ---
+        filters = {}
         if chart_spec and "filters" in chart_spec:
             filters = chart_spec["filters"]
             logger.debug(f"[build_prompt_node] Found filters: {filters}")
 
-        # Build prompt using prompt_builder with filters
-        llm_prompt = build_prompt(numeric_summary, chart_type, filters=filters)
+        # Build prompt with all context (FASE 2: pass enriched_intent)
+        llm_prompt = build_prompt(
+            numeric_summary,
+            chart_type,
+            filters=filters,
+            user_query=user_query,
+            data_table=data_table,
+            intent_context=intent_context,
+            enriched_intent=enriched_intent,
+        )
         state["llm_prompt"] = llm_prompt
+
+        # FASE 2: Build dynamic system prompt based on intent
+        system_prompt = build_system_prompt(enriched_intent)
+        state["system_prompt"] = system_prompt
+        logger.debug(
+            f"[build_prompt_node] Built dynamic system prompt: {len(system_prompt)} chars"
+        )
 
         logger.info(
             f"[build_prompt_node] Built prompt with {len(llm_prompt)} characters"
@@ -605,7 +772,7 @@ def build_prompt_node(state: InsightState) -> InsightState:
             logger.info(
                 f"[build_prompt_node] Included {len(filters)} filters in prompt"
             )
-        logger.debug(f"[build_prompt_node] Prompt preview: {llm_prompt[:200]}...")
+        logger.debug(f"[build_prompt_node] Prompt preview: {llm_prompt[:300]}...")
 
         logger.info("[build_prompt_node] Prompt building complete")
         return state
@@ -643,21 +810,28 @@ def invoke_llm_node(state: InsightState) -> InsightState:
 
         llm_prompt = state["llm_prompt"]
 
-        # Load LLM instance
-        llm = load_insight_llm()
+        # Load LLM instance with FASE 3 dynamic model selection
+        enriched_intent = state.get("enriched_intent")
+        selected_model = select_insight_model(enriched_intent)
+        llm = load_insight_llm(model_override=selected_model)
         # ChatGoogleGenerativeAI uses 'model' attribute, not 'model_name'
         model_identifier = getattr(llm, "model", getattr(llm, "model_name", "unknown"))
-        logger.debug(f"[invoke_llm_node] Loaded LLM: {model_identifier}")
+        logger.info(
+            f"[invoke_llm_node] FASE 3: Selected model '{selected_model}', loaded as '{model_identifier}'"
+        )
 
-        # Build messages with SYSTEM_PROMPT and user prompt
-        # CRITICAL: Send SYSTEM_PROMPT as SystemMessage to enforce formula transparency
+        # Build messages with dynamic system prompt and user prompt
+        # FASE 2: Use build_system_prompt() for intent-driven system message
+        system_prompt = state.get("system_prompt") or build_system_prompt(
+            state.get("enriched_intent")
+        )
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=llm_prompt),
         ]
 
         logger.debug(
-            "[invoke_llm_node] Sending messages with SYSTEM_PROMPT to enforce transparency"
+            "[invoke_llm_node] Sending messages with dynamic system prompt (FASE 2)"
         )
 
         # Invoke LLM with messages
@@ -737,47 +911,33 @@ def invoke_llm_node(state: InsightState) -> InsightState:
 
 def validate_insights_node(state: InsightState) -> InsightState:
     """
-    Node 5: Validate and structure insights (FASE 4 - Unified Output + FASE 5 - Alignment Validation).
+    Node 5: Validate and structure LLM response.
 
-    Parses the unified LLM response containing all report components,
-    validates structure and transparency, and populates state with:
-    - insights (detailed_insights from LLM)
-    - executive_summary
-    - synthesized_narrative
-    - key_findings
-    - next_steps
-
-    FASE 5 Integration:
-    - Validates alignment between narrative and detailed_insights
-    - Applies automatic corrections for misalignments
-    - Implements retry logic for value mismatches (max 2 attempts)
-    - Adds alignment metadata to state
+    FASE 3 Simplification:
+    - Parses JSON response (FASE 2 or legacy format)
+    - Validates basic structure: JSON valid, response non-empty
+    - Removes emoji content
+    - No longer runs alignment validation, corrections, or retry logic
+    - These were designed for the rigid 4-section format which is now replaced
+      by the flexible intention-driven format
 
     Args:
         state: Current workflow state (must contain llm_response)
 
     Returns:
-        Updated state with all insight components, transparency validation,
-        and alignment validation results
-
-    Raises:
-        Adds errors to state if validation fails
+        Updated state with parsed insight components
     """
-    logger.info(
-        "[validate_insights_node] Starting unified insight validation (FASE 4 + 5)"
-    )
+    logger.info("[validate_insights_node] Starting validation (FASE 3 simplified)")
 
     try:
-        # Validate required fields
         if "llm_response" not in state:
             raise ValueError("Missing required field: llm_response")
 
         llm_response = state["llm_response"]
         chart_type = state.get("chart_type", "unknown")
         numeric_summary = state.get("numeric_summary", {})
-        composed_metrics = state.get("composed_metrics", None)
 
-        # Parse unified response (FASE 4 format)
+        # Parse response (handles both FASE 2 and legacy formats)
         parsed_output = _parse_unified_llm_response(
             llm_response, chart_type, numeric_summary
         )
@@ -788,145 +948,52 @@ def validate_insights_node(state: InsightState) -> InsightState:
         synthesized_insights = parsed_output.get("synthesized_insights", {})
         next_steps = parsed_output.get("next_steps", {})
 
+        # FASE 2: Store native fields if present
+        resposta = parsed_output.get("resposta")
+        dados_destacados = parsed_output.get("dados_destacados")
+        filtros_mencionados = parsed_output.get("filtros_mencionados")
+
+        if resposta:
+            # Basic validation: remove emojis
+            resposta = _remove_emojis(resposta)
+            state["resposta"] = resposta
+            logger.info(
+                f"[validate_insights_node] FASE 2 resposta: {len(resposta)} chars"
+            )
+        if dados_destacados:
+            state["dados_destacados"] = dados_destacados
+        if filtros_mencionados:
+            state["filtros_mencionados"] = filtros_mencionados
+
         narrative = synthesized_insights.get("narrative", "")
         key_findings = synthesized_insights.get("key_findings", [])
 
-        # Limit to MAX 5 detailed insights
+        # Limit detailed insights to max 5
         MAX_INSIGHTS = 5
         if len(detailed_insights) > MAX_INSIGHTS:
             logger.warning(
-                f"[validate_insights_node] Truncating {len(detailed_insights)} insights to {MAX_INSIGHTS}"
+                f"[validate_insights_node] Truncating {len(detailed_insights)} "
+                f"insights to {MAX_INSIGHTS}"
             )
             detailed_insights = detailed_insights[:MAX_INSIGHTS]
 
-        # ==================== FASE 5: ALIGNMENT VALIDATION ====================
-        logger.info("[validate_insights_node] FASE 5: Starting alignment validation")
-
-        # Step 1: Validate alignment
-        alignment_result = validate_alignment(
-            narrative=narrative,
-            detailed_insights=detailed_insights,
-            composed_metrics=composed_metrics,
-        )
-
-        logger.info(
-            f"[validate_insights_node] Alignment validation result: "
-            f"score={alignment_result['alignment_score']:.2f}, "
-            f"aligned={alignment_result['is_aligned']}"
-        )
-
-        # Step 2: Apply automatic corrections if needed
-        corrections_applied = []
-
-        if not alignment_result["is_aligned"]:
-            logger.warning(
-                f"[validate_insights_node] Alignment issues detected: "
-                f"{len(alignment_result.get('missing_in_detailed', []))} missing in detailed, "
-                f"{len(alignment_result.get('value_mismatches', []))} value mismatches"
-            )
-
-            # Apply corrections
-            correction_result = apply_corrections(
-                narrative=narrative,
-                detailed_insights=detailed_insights,
-                key_findings=key_findings,
-                executive_summary=executive_summary,
-                validation_result=alignment_result,
-                composed_metrics=composed_metrics,
-            )
-
-            # Update with corrected values
-            detailed_insights = correction_result["detailed_insights"]
-            key_findings = correction_result["key_findings"]
-            executive_summary = correction_result["executive_summary"]
-            corrections_applied = correction_result["corrections_applied"]
-
-            # Corrections may add placeholder insights; keep contract of max 5.
-            if len(detailed_insights) > MAX_INSIGHTS:
-                logger.warning(
-                    f"[validate_insights_node] Truncating corrected {len(detailed_insights)} insights to {MAX_INSIGHTS}"
-                )
-                detailed_insights = detailed_insights[:MAX_INSIGHTS]
-
-            logger.info(
-                f"[validate_insights_node] Applied {len(corrections_applied)} correction(s)"
-            )
-
-            # Re-validate after corrections
-            alignment_result_after = validate_alignment(
-                narrative=narrative,
-                detailed_insights=detailed_insights,
-                composed_metrics=composed_metrics,
-            )
-
-            logger.info(
-                f"[validate_insights_node] Post-correction alignment score: "
-                f"{alignment_result_after['alignment_score']:.2f}"
-            )
-
-        # Step 3: Check if retry is needed for value mismatches
-        retry_count = state.get("_alignment_retry_count", 0)
-        MAX_RETRIES = 2
-
-        if (
-            alignment_result.get("value_mismatches")
-            and retry_count < MAX_RETRIES
-            and len(alignment_result["value_mismatches"]) > 2
-        ):  # Only retry if >2 mismatches
-            logger.warning(
-                f"[validate_insights_node] Significant value mismatches detected. "
-                f"Triggering retry {retry_count + 1}/{MAX_RETRIES}"
-            )
-
-            # Mark for retry by clearing llm_response and incrementing counter
-            state["_alignment_retry_count"] = retry_count + 1
-            state["_retry_reason"] = (
-                f"Value mismatches: {len(alignment_result['value_mismatches'])}"
-            )
-
-            # Return state without populating final fields to trigger re-invocation
-            # This would require workflow modification to support retry
-            # For now, we'll just log and continue with corrections
-            logger.warning(
-                "[validate_insights_node] Retry logic requires workflow support - "
-                "continuing with corrections"
-            )
-
-        # ==================== END FASE 5 ====================
-
-        # Populate state with all components
+        # Populate state with parsed components
         state["insights"] = detailed_insights
         state["executive_summary"] = executive_summary
         state["synthesized_narrative"] = narrative
         state["key_findings"] = key_findings
         state["next_steps"] = next_steps.get("recommendations", [])
 
-        # Add alignment metadata (FASE 5)
-        state["alignment_score"] = alignment_result["alignment_score"]
-        state["alignment_validated"] = alignment_result["is_aligned"]
-        state["corrections_applied"] = corrections_applied
-        state["alignment_warnings"] = alignment_result.get("warnings", [])
+        # Basic transparency flag (non-empty response)
+        has_content = bool(resposta) or bool(detailed_insights) or bool(narrative)
+        state["transparency_validated"] = has_content
 
         logger.info(
-            f"[validate_insights_node] Parsed unified output: "
+            f"[validate_insights_node] Parsed: "
             f"{len(detailed_insights)} insights, "
             f"narrative={len(narrative)} chars, "
             f"{len(key_findings)} key_findings, "
-            f"{len(state['next_steps'])} next_steps, "
-            f"alignment_score={alignment_result['alignment_score']:.2f}"
-        )
-
-        # Validate transparency for detailed_insights
-        transparency_validated = validate_insight_dict_transparency(detailed_insights)
-        state["transparency_validated"] = transparency_validated
-
-        if transparency_validated:
-            logger.info("[validate_insights_node] Transparency validation PASSED")
-        else:
-            logger.warning("[validate_insights_node] Transparency validation FAILED")
-
-        logger.info(
-            "[validate_insights_node] Unified insight validation complete (FASE 4 + 5)"
+            f"has_resposta={bool(resposta)}"
         )
         return state
 
@@ -936,6 +1003,24 @@ def validate_insights_node(state: InsightState) -> InsightState:
             state["errors"] = []
         state["errors"].append(f"validate_insights_node: {str(e)}")
         return state
+
+
+def _remove_emojis(text: str) -> str:
+    """Remove emoji characters from text."""
+    import re
+
+    emoji_pattern = re.compile(
+        "["
+        "\U0001f600-\U0001f64f"  # emoticons
+        "\U0001f300-\U0001f5ff"  # symbols & pictographs
+        "\U0001f680-\U0001f6ff"  # transport & map
+        "\U0001f1e0-\U0001f1ff"  # flags
+        "\U00002702-\U000027b0"  # dingbats
+        "\U000024c2-\U0001f251"
+        "]+",
+        flags=re.UNICODE,
+    )
+    return emoji_pattern.sub("", text)
 
 
 def _parse_unified_llm_response(
@@ -969,6 +1054,72 @@ def _parse_unified_llm_response(
         if not isinstance(response_data, dict):
             raise ValueError(f"Expected dict, got {type(response_data)}")
 
+        # ========== FASE 2: Detect new intention-driven format ==========
+        # New format has "resposta" as primary field instead of 4 fixed sections.
+        # Derive legacy fields from new format for backward compatibility.
+        if "resposta" in response_data:
+            logger.info(
+                "[_parse_unified_llm_response] Detected FASE 2 intention-driven format"
+            )
+
+            resposta = response_data.get("resposta", "")
+            dados_destacados = response_data.get("dados_destacados", [])
+            filtros_mencionados = response_data.get("filtros_mencionados", [])
+
+            # Derive legacy executive_summary from resposta
+            # Title: first sentence or first 80 chars
+            first_sentence = resposta.split(".")[0].strip() if resposta else ""
+            if len(first_sentence) > 80:
+                first_sentence = first_sentence[:77] + "..."
+            executive_summary = {
+                "title": first_sentence or "Análise de Dados",
+                "introduction": resposta[:300] if resposta else "",
+            }
+
+            # Derive legacy detailed_insights from dados_destacados
+            detailed_insights = []
+            for i, dado in enumerate(dados_destacados):
+                detailed_insights.append(
+                    {
+                        "title": f"Destaque {i + 1}",
+                        "content": dado,
+                        "formula": dado,
+                        "interpretation": dado,
+                        "metrics": numeric_summary,
+                        "confidence": 0.9,
+                        "chart_context": chart_type,
+                    }
+                )
+
+            # Derive legacy synthesized_insights from resposta
+            synthesized_insights = {
+                "narrative": resposta,
+                "key_findings": dados_destacados[:5],
+            }
+
+            # Derive legacy next_steps (empty - FASE 2 doesn't generate them)
+            next_steps = {"recommendations": []}
+
+            result = {
+                "executive_summary": executive_summary,
+                "detailed_insights": detailed_insights,
+                "synthesized_insights": synthesized_insights,
+                "next_steps": next_steps,
+                # Preserve FASE 2 native fields
+                "resposta": resposta,
+                "dados_destacados": dados_destacados,
+                "filtros_mencionados": filtros_mencionados,
+            }
+
+            logger.info(
+                f"[_parse_unified_llm_response] FASE 2 parsed: "
+                f"resposta={len(resposta)} chars, "
+                f"{len(dados_destacados)} dados_destacados"
+            )
+
+            return result
+
+        # ========== Legacy FASE 4 format handling ==========
         # Validate required sections
         required_sections = [
             "executive_summary",
@@ -1213,6 +1364,16 @@ def transform_to_markdown_node(state: InsightState) -> InsightState:
         insights = state["insights"]
         chart_type = state.get("chart_type", "unknown")
 
+        # FASE 2: If resposta is available, use it directly as formatted output
+        resposta = state.get("resposta")
+        if resposta:
+            state["formatted_insights"] = resposta
+            logger.info(
+                f"[transform_to_markdown_node] FASE 2: Using resposta directly "
+                f"as formatted_insights ({len(resposta)} chars)"
+            )
+            return state
+
         if not insights:
             logger.warning("[transform_to_markdown_node] No insights to transform")
             state["formatted_insights"] = ""
@@ -1281,102 +1442,128 @@ def transform_to_markdown_node(state: InsightState) -> InsightState:
 
 def format_output_node(state: InsightState) -> InsightState:
     """
-    Node 6: Format final output (FASE 4 - Unified Output + FASE 5 - Alignment Metadata).
+    Node 4 (FASE 3): Validate, transform, and format final output.
 
-    Assembles all results into the final unified output structure with
-    all components from the single LLM call:
-    - executive_summary
-    - detailed_insights
-    - synthesized_insights (narrative + key_findings)
-    - next_steps
-    - metadata (including FASE 5 alignment validation results)
-    - status and error handling
+    FASE 3 Simplification: Merges former validate_insights, transform_to_markdown,
+    and format_output into a single node. The workflow goes:
+        parse_input → build_prompt → invoke_llm → format_output
+
+    This node:
+    1. Parses and validates the LLM JSON response
+    2. Removes emojis, limits insights to max 5
+    3. Stores FASE 2 native fields (resposta, dados_destacados, filtros_mencionados)
+    4. Assembles the final_output dict with metadata
 
     Args:
-        state: Current workflow state (must contain all unified components)
+        state: Current workflow state (must contain llm_response)
 
     Returns:
         Updated state with final_output
-
-    Raises:
-        Adds errors to state if formatting fails
     """
-    logger.info("[format_output_node] Starting unified output formatting (FASE 4 + 5)")
+    logger.info("[format_output_node] Starting (FASE 3 unified)")
 
     try:
-        # Check for errors
-        has_errors = bool(state.get("errors"))
-        status = STATUS_ERROR if has_errors else STATUS_SUCCESS
+        # ==================== STEP 1: VALIDATE LLM RESPONSE ====================
+        if "llm_response" not in state:
+            raise ValueError("Missing required field: llm_response")
 
-        # Get all unified components from state
-        executive_summary = state.get("executive_summary", {})
-        insights = state.get("insights", [])  # detailed_insights
-        formatted_insights = state.get("formatted_insights", "")
-        synthesized_narrative = state.get("synthesized_narrative", "")
-        key_findings = state.get("key_findings", [])
-        next_steps = state.get("next_steps", [])
+        llm_response = state["llm_response"]
+        chart_type = state.get("chart_type", "unknown")
         numeric_summary = state.get("numeric_summary", {})
 
-        # Calculate metadata
-        metrics_count = len(numeric_summary)
+        # Parse response (handles both FASE 2 and legacy formats)
+        parsed_output = _parse_unified_llm_response(
+            llm_response, chart_type, numeric_summary
+        )
+
+        # Extract components
+        executive_summary = parsed_output.get("executive_summary", {})
+        detailed_insights = parsed_output.get("detailed_insights", [])
+        synthesized_insights = parsed_output.get("synthesized_insights", {})
+        next_steps = parsed_output.get("next_steps", {})
+
+        narrative = synthesized_insights.get("narrative", "")
+        key_findings = synthesized_insights.get("key_findings", [])
+
+        # FASE 2: Native fields
+        resposta = parsed_output.get("resposta", "")
+        dados_destacados = parsed_output.get("dados_destacados", [])
+        filtros_mencionados = parsed_output.get("filtros_mencionados", [])
+
+        # Basic validation: remove emojis from resposta
+        if resposta:
+            resposta = _remove_emojis(resposta)
+
+        # Limit detailed insights to max 5
+        MAX_INSIGHTS = 5
+        if len(detailed_insights) > MAX_INSIGHTS:
+            logger.warning(
+                f"[format_output_node] Truncating {len(detailed_insights)} "
+                f"insights to {MAX_INSIGHTS}"
+            )
+            detailed_insights = detailed_insights[:MAX_INSIGHTS]
+
+        # ==================== STEP 2: FORMATTED INSIGHTS ====================
+        # FASE 3: Use resposta directly as formatted output (replaces transform_to_markdown)
+        formatted_insights = resposta if resposta else narrative
+
+        # ==================== STEP 3: ASSEMBLE OUTPUT ====================
+        has_errors = bool(state.get("errors"))
+        status = STATUS_ERROR if has_errors else STATUS_SUCCESS
+        has_content = bool(resposta) or bool(detailed_insights) or bool(narrative)
+
         timestamp = datetime.now().isoformat()
-        transparency_validated = state.get("transparency_validated", False)
 
-        # FASE 5: Get alignment validation metadata
-        alignment_score = state.get("alignment_score", 1.0)
-        alignment_validated = state.get("alignment_validated", True)
-        corrections_applied = state.get("corrections_applied", [])
-        alignment_warnings = state.get("alignment_warnings", [])
-
-        # Build unified final output (FASE 4 + 5)
         final_output = {
             "status": status,
-            "chart_type": state.get("chart_type", "unknown"),
-            # FASE 4: Include all unified components
+            "chart_type": chart_type,
+            # FASE 2: Native intention-driven fields
+            "resposta": resposta,
+            "dados_destacados": dados_destacados,
+            "filtros_mencionados": filtros_mencionados,
+            # Legacy components (backward compat)
             "executive_summary": executive_summary,
-            "detailed_insights": insights,  # List of detailed insights with formula + interpretation
-            "formatted_insights": formatted_insights,  # Executive markdown format (backward compat)
+            "detailed_insights": detailed_insights,
+            "formatted_insights": formatted_insights,
             "synthesized_insights": {
-                "narrative": synthesized_narrative,
+                "narrative": narrative,
                 "key_findings": key_findings,
             },
-            "next_steps": next_steps,
+            "next_steps": next_steps.get("recommendations", []),
             "metadata": {
-                "calculation_time": 0.0,  # Can be enhanced with timing later
-                "metrics_count": metrics_count,
-                "llm_model": "gemini-2.5-flash-preview-09-2025",
+                "calculation_time": 0.0,
+                "metrics_count": len(numeric_summary),
+                "llm_model": state.get("_selected_model", "gemini-2.5-flash"),
                 "timestamp": timestamp,
-                "transparency_validated": transparency_validated,
-                "fase_4_unified": True,  # Flag to indicate FASE 4 unified output
-                # FASE 5: Alignment validation metadata
-                "alignment_score": alignment_score,
-                "alignment_validated": alignment_validated,
-                "corrections_applied": corrections_applied,
-                "alignment_warnings": alignment_warnings,
-                "fase_5_alignment": True,  # Flag to indicate FASE 5 alignment validation
+                "transparency_validated": has_content,
+                "pipeline_version": "fase_3",
             },
             "error": state["errors"][0] if has_errors else None,
         }
 
+        # Include agent_tokens for token tracking
+        if "agent_tokens" in state:
+            final_output["_agent_tokens"] = state["agent_tokens"]
+
         state["final_output"] = final_output
 
-        logger.info(
-            f"[format_output_node] Unified output formatted with status: {status}, "
-            f"alignment_score: {alignment_score:.2f}"
-        )
-        logger.info(
-            f"[format_output_node] Generated {len(insights)} detailed insights, "
-            f"{len(key_findings)} key findings, {len(next_steps)} next steps, "
-            f"{len(corrections_applied)} corrections applied"
-        )
-
-        if alignment_warnings:
-            logger.warning(
-                f"[format_output_node] Alignment warnings: {alignment_warnings}"
-            )
+        # Also populate individual state fields for backward compat
+        state["resposta"] = resposta
+        state["dados_destacados"] = dados_destacados
+        state["filtros_mencionados"] = filtros_mencionados
+        state["insights"] = detailed_insights
+        state["executive_summary"] = executive_summary
+        state["synthesized_narrative"] = narrative
+        state["key_findings"] = key_findings
+        state["next_steps"] = next_steps.get("recommendations", [])
+        state["formatted_insights"] = formatted_insights
+        state["transparency_validated"] = has_content
 
         logger.info(
-            "[format_output_node] Unified output formatting complete (FASE 4 + 5)"
+            f"[format_output_node] Output: status={status}, "
+            f"{len(detailed_insights)} insights, "
+            f"has_resposta={bool(resposta)}, "
+            f"resposta_len={len(resposta)} chars"
         )
         return state
 
@@ -1390,22 +1577,21 @@ def format_output_node(state: InsightState) -> InsightState:
         state["final_output"] = {
             "status": STATUS_ERROR,
             "chart_type": state.get("chart_type", "unknown"),
+            "resposta": "",
+            "dados_destacados": [],
+            "filtros_mencionados": [],
             "executive_summary": {},
             "detailed_insights": [],
+            "formatted_insights": "",
             "synthesized_insights": {"narrative": "", "key_findings": []},
             "next_steps": [],
             "metadata": {
                 "calculation_time": 0.0,
                 "metrics_count": 0,
-                "llm_model": "gemini-2.5-flash-preview-09-2025",
+                "llm_model": "gemini-2.5-flash",
                 "timestamp": datetime.now().isoformat(),
                 "transparency_validated": False,
-                "fase_4_unified": True,
-                "alignment_score": 0.0,
-                "alignment_validated": False,
-                "corrections_applied": [],
-                "alignment_warnings": [],
-                "fase_5_alignment": True,
+                "pipeline_version": "fase_3",
             },
             "error": str(e),
         }

@@ -4,12 +4,12 @@ LangGraph workflow definition for the Insight Generator.
 This module defines the complete workflow graph with all nodes and edges
 that orchestrate the insight generation pipeline.
 
-Workflow:
-    START → parse_input → calculate_metrics → build_prompt
-          → invoke_llm → validate_insights → transform_to_markdown
-          → format_output → END
+FASE 3 Simplified Workflow (4 nodes):
+    START → parse_input → build_prompt → invoke_llm → format_output → END
 
-    With optional conditional routing for error handling and data quality checks.
+    parse_input now includes metric calculation (formerly calculate_metrics).
+    format_output now includes validation and markdown transform
+    (formerly validate_insights + transform_to_markdown + format_output).
 """
 
 import logging
@@ -19,11 +19,8 @@ from langgraph.graph import StateGraph, END
 from .state import InsightState
 from .nodes import (
     parse_input_node,
-    calculate_metrics_node,
     build_prompt_node,
     invoke_llm_node,
-    validate_insights_node,
-    transform_to_markdown_node,
     format_output_node,
 )
 from .router import should_continue, should_invoke_llm
@@ -41,31 +38,19 @@ def create_insight_generator_workflow(
     """
     Create and compile the Insight Generator LangGraph workflow.
 
-    This workflow processes chart specifications and analytics results to
-    generate strategic insights using LLM-powered analysis.
-
-    Workflow Steps:
-        1. parse_input: Extract and validate input from upstream agents
-        2. calculate_metrics: Compute chart-type-specific numeric metrics
-        3. build_prompt: Format metrics into LLM prompt with JSON schema
-        4. invoke_llm: Generate insights using GPT-5-nano (JSON mode)
-        5. validate_insights: Validate transparency and structure insights
-        6. transform_to_markdown: Transform JSON insights to executive markdown
-        7. format_output: Assemble final output with metadata
+    FASE 3 Simplified Pipeline (4 nodes):
+        1. parse_input: Extract/validate input + calculate metrics (inline)
+        2. build_prompt: Format metrics into LLM prompt
+        3. invoke_llm: Generate insights using Gemini (dynamic model selection)
+        4. format_output: Validate response, transform, assemble final output
 
     Args:
         verbose: If True, enable verbose logging for debugging
         use_conditional_edges: If True, use conditional routing for error handling
-                               (default: False for simpler linear flow)
+        prompt_mode: Override for prompt mode ("legacy" or "dynamic")
 
     Returns:
         Compiled StateGraph ready for execution via invoke()
-
-    Example:
-        >>> workflow = create_insight_generator_workflow()
-        >>> state = initialize_state(chart_spec, analytics_result)
-        >>> result = workflow.invoke(state)
-        >>> print(result["final_output"])
     """
     if verbose:
         logging.basicConfig(level=logging.DEBUG)
@@ -73,25 +58,23 @@ def create_insight_generator_workflow(
 
     prompt_mode_effective = (prompt_mode or INSIGHT_PROMPT_MODE or "legacy").lower()
     logger.info(
-        "Creating Insight Generator workflow (prompt_mode=%s)", prompt_mode_effective
+        "Creating Insight Generator workflow (FASE 3, prompt_mode=%s)",
+        prompt_mode_effective,
     )
 
     # Initialize StateGraph with InsightState schema
     workflow = StateGraph(InsightState)
 
-    # ========== Add Nodes ==========
-    logger.debug("Adding workflow nodes")
+    # ========== Add Nodes (4 nodes - FASE 3) ==========
+    logger.debug("Adding workflow nodes (FASE 3 simplified)")
 
     workflow.add_node("parse_input", parse_input_node)
-    workflow.add_node("calculate_metrics", calculate_metrics_node)
 
     if prompt_mode_effective == "dynamic":
         workflow.add_node("build_prompt", dynamic_build_prompt_node)
     else:
         workflow.add_node("build_prompt", build_prompt_node)
     workflow.add_node("invoke_llm", invoke_llm_node)
-    workflow.add_node("validate_insights", validate_insights_node)
-    workflow.add_node("transform_to_markdown", transform_to_markdown_node)
     workflow.add_node("format_output", format_output_node)
 
     # ========== Define Entry Point ==========
@@ -102,17 +85,14 @@ def create_insight_generator_workflow(
 
     if use_conditional_edges:
         # Advanced workflow with conditional routing
-        logger.info("Using conditional edge routing")
+        logger.info("Using conditional edge routing (FASE 3)")
 
-        # parse_input → check errors → calculate_metrics or end
+        # parse_input → check errors → build_prompt or end
         workflow.add_conditional_edges(
             "parse_input",
             should_continue,
-            {"continue": "calculate_metrics", "end": "format_output"},
+            {"continue": "build_prompt", "end": "format_output"},
         )
-
-        # calculate_metrics → build_prompt
-        workflow.add_edge("calculate_metrics", "build_prompt")
 
         # build_prompt → check if should invoke LLM → invoke_llm or skip
         workflow.add_conditional_edges(
@@ -121,31 +101,22 @@ def create_insight_generator_workflow(
             {"invoke": "invoke_llm", "skip": "format_output"},
         )
 
-        # invoke_llm → validate_insights
-        workflow.add_edge("invoke_llm", "validate_insights")
-
-        # validate_insights → transform_to_markdown
-        workflow.add_edge("validate_insights", "transform_to_markdown")
-
-        # transform_to_markdown → format_output
-        workflow.add_edge("transform_to_markdown", "format_output")
+        # invoke_llm → format_output
+        workflow.add_edge("invoke_llm", "format_output")
 
         # format_output → END
         workflow.add_edge("format_output", END)
 
     else:
         # Simple linear workflow (default)
-        logger.info("Using linear edge routing")
+        logger.info("Using linear edge routing (FASE 3)")
 
-        workflow.add_edge("parse_input", "calculate_metrics")
-        workflow.add_edge("calculate_metrics", "build_prompt")
+        workflow.add_edge("parse_input", "build_prompt")
         workflow.add_edge("build_prompt", "invoke_llm")
-        workflow.add_edge("invoke_llm", "validate_insights")
-        workflow.add_edge("validate_insights", "transform_to_markdown")
-        workflow.add_edge("transform_to_markdown", "format_output")
+        workflow.add_edge("invoke_llm", "format_output")
         workflow.add_edge("format_output", END)
 
-    logger.info("Workflow created successfully")
+    logger.info("Workflow created successfully (4 nodes)")
 
     # Compile and return
     return workflow.compile()
@@ -225,7 +196,9 @@ def execute_workflow(
 
         # DEBUG: Log agent_tokens presence
         if "agent_tokens" in final_state:
-            logger.info(f"[execute_workflow] agent_tokens found in final_state: {list(final_state['agent_tokens'].keys())}")
+            logger.info(
+                f"[execute_workflow] agent_tokens found in final_state: {list(final_state['agent_tokens'].keys())}"
+            )
         else:
             logger.warning("[execute_workflow] agent_tokens NOT found in final_state")
 
@@ -241,9 +214,10 @@ def execute_workflow(
                 "metadata": {
                     "calculation_time": 0.0,
                     "metrics_count": 0,
-                    "llm_model": "gpt-5-nano-2025-08-07",
+                    "llm_model": "gemini-2.5-flash",
                     "timestamp": "",
                     "transparency_validated": False,
+                    "pipeline_version": "fase_3",
                 },
             }
 
@@ -263,9 +237,10 @@ def execute_workflow(
             "metadata": {
                 "calculation_time": 0.0,
                 "metrics_count": 0,
-                "llm_model": "gpt-5-nano-2025-08-07",
+                "llm_model": "gemini-2.5-flash",
                 "timestamp": "",
                 "transparency_validated": False,
+                "pipeline_version": "fase_3",
             },
         }
 

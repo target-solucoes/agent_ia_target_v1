@@ -9,6 +9,7 @@ from .insight_schemas import (
     InsightMetadata,
     InsightOutput,
     load_insight_llm,
+    select_insight_model,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "InsightMetadata",
     "InsightOutput",
     "load_insight_llm",
+    "select_insight_model",
 ]

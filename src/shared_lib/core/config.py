@@ -164,7 +164,8 @@ class InsightLLMConfig(LLMConfig):
     """
     Configuration for insight_generator.
 
-    Balanced settings for insight extraction with JSON output.
+    FASE 3: Upgraded to gemini-2.5-flash (from flash-lite) for higher
+    narrative quality. Temperature reduced to 0.4 for balanced output.
     Always uses JSON mode for structured insights.
 
     Note: Gemini 2.5 models with thinking require higher max_output_tokens
@@ -173,8 +174,9 @@ class InsightLLMConfig(LLMConfig):
     with finish_reason='MAX_TOKENS'.
     """
 
+    model: str = "gemini-2.5-flash"  # FASE 3: Upgraded from flash-lite
     max_output_tokens: int = 8192  # Higher limit for Gemini 2.5 thinking models
-    temperature: float = 0.7  # Higher temperature for creative insights
+    temperature: float = 0.4  # FASE 3: Balanced between creativity and consistency
 
     def __post_init__(self):
         """Set JSON mode for insights (Gemini style)."""
@@ -318,7 +320,9 @@ try:
 except ImportError:
     # Fallback to env vars if graphic_classifier not available
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gemini-2.5-flash-lite")  # Legacy compatibility - now using Gemini
+    OPENAI_MODEL = os.getenv(
+        "OPENAI_MODEL", "gemini-2.5-flash-lite"
+    )  # Legacy compatibility - now using Gemini
     ALIAS_PATH = "data/alias"
     DATASET_PATH = "data/datasets"
     LOG_LEVEL = "INFO"

@@ -101,6 +101,17 @@ def dynamic_build_prompt_node(state: InsightState) -> InsightState:
         if analytics_metadata is None:
             analytics_metadata = state.get("analytics_result", {}).get("metadata")
 
+        # FASE 1: Extract user_query for dynamic prompt
+        user_query = ""
+        if chart_spec:
+            user_query = chart_spec.get("user_query", "")
+        if not user_query:
+            user_query = (
+                state.get("analytics_result", {})
+                .get("metadata", {})
+                .get("user_query", "")
+            )
+
         # Build dynamic prompt
         llm_prompt = build_dynamic_prompt(
             enriched_intent=enriched_intent,
@@ -108,6 +119,32 @@ def dynamic_build_prompt_node(state: InsightState) -> InsightState:
             chart_spec=chart_spec,
             analytics_metadata=analytics_metadata,
         )
+
+        # FASE 1: Prepend user_query and data table to dynamic prompt
+        prefix_sections = []
+
+        if user_query:
+            prefix_sections.append(
+                f'PERGUNTA DO USUARIO:\n"{user_query}"\n\n'
+                f"Sua resposta DEVE responder diretamente a esta pergunta."
+            )
+
+        # Include real data if available
+        import pandas as pd
+
+        df = state.get("data")
+        if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+            from .nodes import _format_dataframe_as_markdown
+
+            data_table = _format_dataframe_as_markdown(df, max_rows=20)
+            if data_table:
+                prefix_sections.append(
+                    f"DADOS DISPONÍVEIS:\n{data_table}\n\n"
+                    f"Use estes dados para fundamentar sua resposta com valores específicos."
+                )
+
+        if prefix_sections:
+            llm_prompt = "\n\n".join(prefix_sections) + "\n\n" + llm_prompt
 
         state["llm_prompt"] = llm_prompt
 
